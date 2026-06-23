@@ -116,8 +116,7 @@ All papers by Dan Joseph M. Fernandez / Primordial Omega Zero — 2026
 
 | Test | Content | Result | Video |
 |------|---------|--------|-------|
-| Test 1 | Cinematic — Full Harmonization | 5/5 Phases ✅ | [Watch](assets/BYC-GoogleFHETest1&2.mp4) |
-| Test 2 | Final — Engine Comparison + Proof | 6/6 Tests ✅ | [Watch](assets/BYC-GoogleFHETest1&2.mp4) |
+| Test 1 & 2 | Cinematic + Final — Full Harmonization & Engine Comparison | 6/6 Tests ✅ | [Watch](assets/BYC-GoogleFHETest1&2.mp4) |
 
 ---
 
