@@ -1,0 +1,314 @@
+#include "lib/Utils/Utils.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <iomanip>
+#include <ios>
+#include <map>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "lib/Utils/MathUtils.h"
+#include "llvm/include/llvm/ADT/STLExtras.h"            // from @llvm-project
+#include "llvm/include/llvm/ADT/TypeSwitch.h"           // from @llvm-project
+#include "llvm/include/llvm/Support/Casting.h"          // from @llvm-project
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"   // from @llvm-project
+#include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Attributes.h"            // from @llvm-project
+#include "mlir/include/mlir/IR/Builders.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinAttributeInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinAttributes.h"      // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinTypeInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Operation.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/OperationSupport.h"       // from @llvm-project
+#include "mlir/include/mlir/IR/SymbolTable.h"            // from @llvm-project
+#include "mlir/include/mlir/IR/TypeUtilities.h"          // from @llvm-project
+#include "mlir/include/mlir/IR/Types.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/Value.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/Visitors.h"               // from @llvm-project
+#include "mlir/include/mlir/Support/LLVM.h"              // from @llvm-project
+#include "mlir/include/mlir/Support/WalkResult.h"        // from @llvm-project
+
+namespace mlir {
+namespace heir {
+
+Operation* walkAndDetect(Operation* op, OpPredicate predicate) {
+  Operation* foundOp = nullptr;
+  op->walk<WalkOrder::PreOrder>([&](Operation* op) {
+    if (predicate(op)) {
+      foundOp = op;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return foundOp;
+}
+
+LogicalResult validateValues(Operation* op, IsValidValueFn isValidValue) {
+  bool argRes = llvm::all_of(op->getOperands(), [&](Value value) {
+    return succeeded(isValidValue(value));
+  });
+  return !argRes ? failure() : success();
+}
+
+LogicalResult validateTypes(Operation* op, IsValidTypeFn isValidType) {
+  bool argRes = llvm::all_of(op->getOperandTypes(), [&](Type type) {
+    return succeeded(isValidType(type));
+  });
+  bool resultRes = llvm::all_of(op->getResultTypes(), [&](Type type) {
+    return succeeded(isValidType(type));
+  });
+  return (!argRes || !resultRes) ? failure() : success();
+}
+
+LogicalResult walkAndValidateValues(Operation* op, IsValidValueFn isValidValue,
+                                    std::optional<std::string> err) {
+  LogicalResult res = success();
+  op->walk([&](Operation* op) {
+    res = validateValues(op, isValidValue);
+    if (failed(res) && err.has_value()) op->emitError() << err.value();
+    return failed(res) ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  return res;
+}
+
+void walkValues(Operation* op, ValueProcessor valueProcessor) {
+  op->walk([&](Operation* op) {
+    // Region-holding ops may not have operands or results, but their region's
+    // arguments are BlockArguments that may not be processed by any other
+    // means, e.g., an unused function argument, cf.
+    // https://github.com/google/heir/issues/1406
+    if (op->getNumRegions() > 0) {
+      for (auto& region : op->getRegions()) {
+        for (auto& block : region.getBlocks()) {
+          for (auto arg : block.getArguments()) {
+            valueProcessor(arg);
+          }
+        }
+      }
+    }
+
+    if (op->getNumResults() > 0) {
+      for (auto result : op->getResults()) {
+        valueProcessor(result);
+      }
+    }
+
+    if (op->getNumOperands() > 0) {
+      for (auto operand : op->getOperands()) {
+        valueProcessor(operand);
+      }
+    }
+  });
+}
+
+bool containsArgumentOfType(Operation* op, TypePredicate predicate) {
+  // special treatment for func declaration
+  if (auto funcOp = dyn_cast<func::FuncOp>(op)) {
+    return llvm::any_of(funcOp.getArgumentTypes(),
+                        [&](Type type) { return predicate(type); });
+  }
+  return llvm::any_of(op->getRegions(), [&](Region& region) {
+    return llvm::any_of(region.getBlocks(), [&](Block& block) {
+      return llvm::any_of(block.getArguments(), [&](BlockArgument arg) {
+        return predicate(arg.getType());
+      });
+    });
+  });
+}
+
+void iterateIndices(ArrayRef<int64_t> shape, const IndexTupleConsumer& process,
+                    ArrayRef<int64_t> fixedIndices,
+                    ArrayRef<int64_t> fixedIndexValues) {
+  if (shape.empty()) return;
+  assert(fixedIndices.size() == fixedIndexValues.size() &&
+         "size mismatch on fixed indices");
+  for (size_t i = 0; i < fixedIndices.size(); ++i) {
+    assert(fixedIndices[i] >= 0 ||
+           fixedIndices[i] < static_cast<int64_t>(shape.size()) &&
+               "Fixed index is out of range");
+    assert(fixedIndexValues[i] >= 0 ||
+           fixedIndexValues[i] < shape[fixedIndices[i]] &&
+               "Fixed index value is out of range");
+  }
+
+  std::map<int64_t, int64_t> fixedIndexToValue;
+  for (size_t i = 0; i < fixedIndices.size(); ++i) {
+    fixedIndexToValue[fixedIndices[i]] = fixedIndexValues[i];
+  }
+
+  auto isFixed = [&fixedIndexToValue](int64_t idx) -> bool {
+    return fixedIndexToValue.count(idx) > 0;
+  };
+
+  std::vector<int64_t> indices(shape.size(), 0);
+  // Pre-populate with fixed indices
+  for (size_t i = 0; i < fixedIndices.size(); ++i) {
+    indices[fixedIndices[i]] = fixedIndexValues[i];
+  }
+
+  bool done = false;
+
+  while (!done) {
+    // Process current indices
+    process(indices);
+
+    int dim = shape.size() - 1;
+    while (dim >= 0) {
+      if (!isFixed(dim)) {
+        indices[dim]++;
+        if (indices[dim] < shape[dim]) {
+          // No carry needed
+          break;
+        }
+        // Reset this digit and move to the next
+        indices[dim] = 0;
+      }
+      dim--;
+    }
+
+    // If we've decremented past the first dimension, we're done
+    if (dim < 0) {
+      done = true;
+    }
+  }
+}
+
+std::string doubleToString2Prec(double value) {
+  std::stringstream stream;
+  stream << std::fixed << std::setprecision(2) << value;
+  return stream.str();
+}
+
+TypedAttr getScalarOrDenseAttr(Type tensorOrScalarType, APFloat value) {
+  return TypeSwitch<Type, TypedAttr>(tensorOrScalarType)
+      .Case<FloatType>([&](FloatType type) {
+        APFloat converted =
+            convertFloatToSemantics(value, type.getFloatSemantics());
+        return static_cast<TypedAttr>(FloatAttr::get(type, converted));
+      })
+      .Case<ShapedType>([&](ShapedType type) {
+        auto elemType = dyn_cast<FloatType>(type.getElementType());
+        if (!elemType) return TypedAttr();
+        APFloat converted =
+            convertFloatToSemantics(value, elemType.getFloatSemantics());
+        return static_cast<TypedAttr>(DenseElementsAttr::get(type, converted));
+      })
+      .Default([](Type) { return nullptr; });
+}
+
+TypedAttr getScalarOrDenseAttr(Type tensorOrScalarType, APInt value) {
+  return TypeSwitch<Type, TypedAttr>(tensorOrScalarType)
+      .Case<IntegerType>([&](IntegerType type) {
+        return static_cast<TypedAttr>(IntegerAttr::get(type, value));
+      })
+      .Case<ShapedType>([&](ShapedType type) {
+        return static_cast<TypedAttr>(DenseElementsAttr::get(type, value));
+      })
+      .Default([](Type) { return nullptr; });
+}
+
+Operation* makeAppropriatelyTypedAddOp(OpBuilder& builder, Location loc,
+                                       Value lhs, Value rhs,
+                                       ArrayRef<NamedAttribute> attrs) {
+  assert(lhs.getType() == rhs.getType() &&
+         "lhs and rhs must have the same type");
+  StringRef addOpName = isa<IntegerType>(getElementTypeOrSelf(lhs.getType()))
+                            ? "arith.addi"
+                            : "arith.addf";
+  return builder.create(
+      OperationState(loc, addOpName, {lhs, rhs}, {lhs.getType()}, attrs));
+}
+
+Operation* makeAppropriatelyTypedMulOp(OpBuilder& builder, Location loc,
+                                       Value lhs, Value rhs,
+                                       ArrayRef<NamedAttribute> attrs) {
+  assert(lhs.getType() == rhs.getType() &&
+         "lhs and rhs must have the same type");
+  StringRef addOpName = isa<IntegerType>(getElementTypeOrSelf(lhs.getType()))
+                            ? "arith.muli"
+                            : "arith.mulf";
+  return builder.create(
+      OperationState(loc, addOpName, {lhs, rhs}, {lhs.getType()}, attrs));
+}
+
+/// Returns true if and only if all types in the given values are the same.
+bool allTypesMatch(ArrayRef<Value> values) {
+  Type firstType = values.front().getType();
+  return llvm::all_of(
+      values, [&](Value value) { return value.getType() == firstType; });
+}
+
+/// Extends all (integer-typed) values to the largest bitwidth among them and
+/// returns the new list of values.
+SmallVector<Value> extendToCommonWidth(
+    OpBuilder& b, ArrayRef<Value> values,
+    const std::function<void(Operation*)>& createdOpCallback) {
+  int64_t maxWidth = 0;
+  for (Value value : values) {
+    auto intType = cast<IntegerType>(value.getType());
+    maxWidth = std::max(maxWidth, static_cast<int64_t>(intType.getWidth()));
+  }
+
+  SmallVector<Value> extendedValues;
+  extendedValues.reserve(values.size());
+  auto upcastType = IntegerType::get(b.getContext(), maxWidth);
+  for (Value value : values) {
+    auto intType = cast<IntegerType>(value.getType());
+    if (intType.getWidth() < maxWidth) {
+      Operation* extOp;
+      if (intType.getWidth() == 1) {
+        // To preserve the sign of a boolean true value, use unsigned extension.
+        extOp = arith::ExtUIOp::create(b, value.getLoc(), upcastType, value);
+      } else {
+        extOp = arith::ExtSIOp::create(b, value.getLoc(), upcastType, value);
+      }
+      if (createdOpCallback) {
+        createdOpCallback(extOp);
+      }
+      extendedValues.push_back(extOp->getResult(0));
+    } else {
+      extendedValues.push_back(value);
+    }
+  }
+  return extendedValues;
+}
+
+FailureOr<func::FuncOp> getCalledFunction(func::CallOp callOp) {
+  SymbolRefAttr sym =
+      llvm::dyn_cast_or_null<SymbolRefAttr>(callOp.getCallableForCallee());
+  if (!sym) return failure();
+  auto maybeFuncOp = dyn_cast_or_null<func::FuncOp>(
+      SymbolTable::lookupNearestSymbolFrom(callOp, sym));
+  if (!maybeFuncOp) return failure();
+  return maybeFuncOp;
+}
+
+LogicalResult containsExactlyOneOrEmitError(
+    Operation* op, Value dynamicValue, std::optional<Attribute> staticAttr) {
+  if (dynamicValue != Value() && staticAttr.has_value()) {
+    return op->emitOpError()
+           << "contains both static and dynamic operand; expected just one.";
+  }
+
+  if (dynamicValue == Value() && !staticAttr.has_value()) {
+    return op->emitOpError()
+           << "contains neither static nor dynamic operand; expected one.";
+  }
+
+  return success();
+}
+
+LogicalResult containsExactlyOneOrEmitError(Operation* op, Value dynamicValue,
+                                            Attribute staticAttr) {
+  return containsExactlyOneOrEmitError(op, dynamicValue,
+                                       std::optional<Attribute>{staticAttr});
+}
+
+}  // namespace heir
+}  // namespace mlir

@@ -1,0 +1,110 @@
+#ifndef LIB_DIALECT_MODULEATTRIBUTES_H_
+#define LIB_DIALECT_MODULEATTRIBUTES_H_
+
+#include "llvm/include/llvm/ADT/StringRef.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Attributes.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Operation.h"   // from @llvm-project
+
+namespace mlir {
+namespace heir {
+
+/*===----------------------------------------------------------------------===*/
+// Module Attributes for Scheme
+/*===----------------------------------------------------------------------===*/
+
+// These attributes are intended to be set early on in the compilation pipeline,
+// and checked by individual passes that need to know the target scheme. This
+// avoids threading CLI flags through pass and sub-pipeline options.
+constexpr const static ::llvm::StringLiteral kBGVSchemeAttrName = "scheme.bgv";
+constexpr const static ::llvm::StringLiteral kBFVSchemeAttrName = "scheme.bfv";
+constexpr const static ::llvm::StringLiteral kCKKSSchemeAttrName =
+    "scheme.ckks";
+constexpr const static ::llvm::StringLiteral kCGGISchemeAttrName =
+    "scheme.cggi";
+
+constexpr const static ::llvm::StringLiteral kRequestedSlotCountAttrName =
+    "scheme.requested_slot_count";
+constexpr const static ::llvm::StringLiteral kActualSlotCountAttrName =
+    "scheme.actual_slot_count";
+
+bool moduleIsBGV(Operation* moduleOp);
+bool moduleIsBFV(Operation* moduleOp);
+bool moduleIsBGVOrBFV(Operation* moduleOp);
+bool moduleIsCKKS(Operation* moduleOp);
+bool moduleIsCGGI(Operation* moduleOp);
+
+// Fetch the scheme parameter attribute from the parent module op. This
+// parameter is only set on the module after a parameter selection pass runs.
+Attribute getSchemeParamAttr(Operation* op);
+
+void moduleClearScheme(Operation* moduleOp);
+
+void moduleSetBGV(Operation* moduleOp);
+void moduleSetBFV(Operation* moduleOp);
+void moduleSetCKKS(Operation* moduleOp);
+void moduleSetCGGI(Operation* moduleOp);
+
+/*===----------------------------------------------------------------------===*/
+// Module Attributes for Backend
+/*===----------------------------------------------------------------------===*/
+
+// Similar to the scheme attributes, these indicate the target backend for
+// passes to branch behavior on.
+constexpr const static ::llvm::StringLiteral kOpenfheBackendAttrName =
+    "backend.openfhe";
+constexpr const static ::llvm::StringLiteral kLattigoBackendAttrName =
+    "backend.lattigo";
+
+bool moduleIsOpenfhe(Operation* moduleOp);
+bool moduleIsLattigo(Operation* moduleOp);
+
+void moduleClearBackend(Operation* moduleOp);
+
+void moduleSetOpenfhe(Operation* moduleOp);
+void moduleSetLattigo(Operation* moduleOp);
+
+// Func attributes for client helpers
+//
+// This corresponds to a named attribute client.enc_func whose
+// value is a dictionary {func_name = "foo", index = 2 : i64}
+//
+// This means that the function with this attribute is an encryption
+// helper for the function "foo" and the argument at index 2.
+
+constexpr const static ::llvm::StringLiteral kClientEncFuncAttrName =
+    "client.enc_func";
+constexpr const static ::llvm::StringLiteral kClientDecFuncAttrName =
+    "client.dec_func";
+constexpr const static ::llvm::StringLiteral kClientPackFuncAttrName =
+    "client.pack_func";
+constexpr const static ::llvm::StringLiteral kClientEncZeroFuncAttrName =
+    "client.enc_zero_func";
+constexpr const static ::llvm::StringLiteral kClientEncZeroArgAttrName =
+    "client.enc_zero_arg";
+
+// Corresponds to a named attribute client.preprocessed_func whose value is a
+// dictionary {func_name = "foo"} that references the name of the function that
+// this was derived from. This preprocessed function contains just the
+// ciphertexts workload of the original function, with any plaintexts processing
+// done ahead of time and passed in with new arguments.
+constexpr const static ::llvm::StringLiteral kClientPreprocessedFuncAttrName =
+    "client.preprocessed_func";
+
+inline bool isClientHelper(Operation* op) {
+  return op->hasAttr(kClientEncFuncAttrName) ||
+         op->hasAttr(kClientDecFuncAttrName) ||
+         op->hasAttr(kClientPackFuncAttrName) ||
+         op->hasAttr(kClientPreprocessedFuncAttrName) ||
+         op->hasAttr(kClientEncZeroFuncAttrName);
+}
+
+// The name of the function this client helper is made for.
+constexpr const static ::llvm::StringLiteral kClientHelperFuncName =
+    "func_name";
+// The argument or operand index the client helper function is for.
+constexpr const static ::llvm::StringLiteral kClientHelperIndex = "index";
+
+}  // namespace heir
+}  // namespace mlir
+
+#endif  // LIB_DIALECT_MODULEATTRIBUTES_H_

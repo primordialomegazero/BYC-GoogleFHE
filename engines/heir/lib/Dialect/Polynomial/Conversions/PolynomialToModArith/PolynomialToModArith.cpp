@@ -1,0 +1,1692 @@
+#include "lib/Dialect/Polynomial/Conversions/PolynomialToModArith/PolynomialToModArith.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "lib/Dialect/ModArith/IR/ModArithAttributes.h"
+#include "lib/Dialect/ModArith/IR/ModArithOps.h"
+#include "lib/Dialect/ModArith/IR/ModArithTypeInterfaces.h"
+#include "lib/Dialect/ModArith/IR/ModArithTypes.h"
+#include "lib/Dialect/Polynomial/IR/PolynomialAttributes.h"
+#include "lib/Dialect/Polynomial/IR/PolynomialDialect.h"
+#include "lib/Dialect/Polynomial/IR/PolynomialOps.h"
+#include "lib/Dialect/Polynomial/IR/PolynomialTypes.h"
+#include "lib/Dialect/RNS/IR/RNSAttributes.h"
+#include "lib/Dialect/RNS/IR/RNSOps.h"
+#include "lib/Dialect/RNS/IR/RNSTypes.h"
+#include "lib/Utils/APIntUtils.h"
+#include "lib/Utils/ConversionUtils.h"
+#include "lib/Utils/Polynomial/Polynomial.h"
+#include "lib/Utils/Utils.h"
+#include "llvm/include/llvm/ADT/STLExtras.h"             // from @llvm-project
+#include "llvm/include/llvm/Support/Casting.h"           // from @llvm-project
+#include "llvm/include/llvm/Support/FormatVariadic.h"    // from @llvm-project
+#include "llvm/include/llvm/Support/raw_ostream.h"       // from @llvm-project
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
+#include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
+#include "mlir/include/mlir/Dialect/LLVMIR/LLVMAttrs.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Linalg/IR/Linalg.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
+#include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Utils/StructuredOpsUtils.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/AffineExpr.h"             // from @llvm-project
+#include "mlir/include/mlir/IR/AffineMap.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinAttributes.h"      // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinOps.h"             // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinTypeInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinTypes.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/Diagnostics.h"            // from @llvm-project
+#include "mlir/include/mlir/IR/IRMapping.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/Location.h"               // from @llvm-project
+#include "mlir/include/mlir/IR/OpDefinition.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/PatternMatch.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/TypeRange.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/TypeUtilities.h"          // from @llvm-project
+#include "mlir/include/mlir/IR/ValueRange.h"             // from @llvm-project
+#include "mlir/include/mlir/IR/Visitors.h"               // from @llvm-project
+#include "mlir/include/mlir/Support/LLVM.h"              // from @llvm-project
+#include "mlir/include/mlir/Support/LogicalResult.h"     // from @llvm-project
+#include "mlir/include/mlir/Transforms/DialectConversion.h"  // from @llvm-project
+
+// IWYU pragma: begin_keep
+#include "lib/Dialect/RNS/IR/RNSDialect.h"
+#include "mlir/include/mlir/Dialect/LLVMIR/LLVMDialect.h"  // from @llvm-project
+// IWYU pragma: end_keep
+
+namespace mlir {
+namespace heir {
+namespace polynomial {
+
+using namespace mlir::heir::polynomial;
+using namespace mlir::heir::mod_arith;
+using namespace mlir::heir::rns;
+
+#define DEBUG_TYPE "polynomial-to-mod-arith"
+
+#define GEN_PASS_DEF_POLYNOMIALTOMODARITH
+#include "lib/Dialect/Polynomial/Conversions/PolynomialToModArith/PolynomialToModArith.h.inc"
+
+// Callback type for getting pre-generated FuncOp implementing
+// helper functions for various lowerings.
+using GetFuncCallbackTy = function_ref<func::FuncOp(FunctionType, RingAttr)>;
+
+RankedTensorType convertPolynomialType(PolynomialType type) {
+  RingAttr attr = type.getRing();
+  // We must remove the ring attribute on the tensor, since the
+  // unrealized_conversion_casts cannot carry the poly.ring attribute
+  // through.
+  auto degree = attr.getPolynomialModulus().getPolynomial().getDegree();
+  return RankedTensorType::get({degree}, attr.getCoefficientType());
+}
+
+struct CommonConversionInfo {
+  PolynomialType polynomialType;
+  RingAttr ringAttr;
+
+  Type coefficientType;
+  Type coefficientStorageType;
+
+  APInt coefficientModulusValue;
+  unsigned coefficientModulusWidth;
+
+  // Poly -> tensor converted type
+  RankedTensorType tensorType;
+};
+
+std::optional<ModArithType> getSingleResidueModArithType(Type type) {
+  auto modType = dyn_cast<ModQTypeInterface>(type);
+  if (!modType || modType.getNumResidues() != 1) {
+    return std::nullopt;
+  }
+  if (auto residueType = dyn_cast<ModArithType>(modType.getResidueType(0))) {
+    return residueType;
+  }
+  return std::nullopt;
+}
+
+FailureOr<CommonConversionInfo> getCommonConversionInfo(
+    Operation* op, const TypeConverter* typeConverter,
+    std::optional<Type> polyType = std::nullopt) {
+  // Most ops have a single result type that is a polynomial
+  PolynomialType polyTy;
+  if (polyType.has_value()) {
+    polyTy = dyn_cast<PolynomialType>(polyType.value());
+  } else {
+    polyTy = dyn_cast<PolynomialType>(op->getResult(0).getType());
+  }
+
+  if (!polyTy) {
+    op->emitError(
+        "Can't directly lower for a tensor of polynomials. "
+        "First run --convert-elementwise-to-affine.");
+    return failure();
+  }
+
+  CommonConversionInfo info;
+  info.polynomialType = polyTy;
+  info.ringAttr = polyTy.getRing();
+  info.coefficientType = polyTy.getRing().getCoefficientType();
+  info.tensorType = cast<RankedTensorType>(typeConverter->convertType(polyTy));
+
+  FailureOr<Type> res =
+      llvm::TypeSwitch<Type, FailureOr<Type>>(info.coefficientType)
+          .Case<IntegerType>([&](auto intTy) { return intTy; })
+          .Case<FloatType>([&](auto floatTy) { return floatTy; })
+          .Case<ModQTypeInterface>([&](ModQTypeInterface mqTy) {
+            return dyn_cast<IntegerType>(
+                getElementTypeOrSelf(mqTy.getLoweringType()));
+          })
+          .Default([&](Type ty) { return failure(); });
+  if (failed(res)) {
+    assert(false && "unsupported coefficient type");
+  }
+  info.coefficientStorageType = res.value();
+  return std::move(info);
+}
+
+Value getConstantCoefficient(Type type, int64_t value,
+                             ImplicitLocOpBuilder& builder) {
+  return llvm::TypeSwitch<Type, Value>(type)
+      .Case<IntegerType>([&](auto intTy) {
+        return arith::ConstantOp::create(builder,
+                                         builder.getIntegerAttr(intTy, value));
+      })
+      .Case<ModArithType>([&](ModArithType modTy) {
+        return mod_arith::ConstantOp::create(
+            builder, modTy,
+            IntegerAttr::get(modTy.getModulus().getType(), value));
+      })
+      .Case<RNSType>([&](RNSType rnsTy) {
+        auto basisTypes = rnsTy.getBasisTypes();
+        auto firstModType = cast<ModArithType>(basisTypes[0]);
+        auto width = firstModType.getModulus().getType();
+        auto numLimbs = basisTypes.size();
+        auto storageTy = RankedTensorType::get({(int64_t)numLimbs}, width);
+        auto storageCst = arith::ConstantOp::create(
+            builder, DenseElementsAttr::get(
+                         storageTy, builder.getIntegerAttr(width, value)));
+        return mod_arith::EncapsulateOp::create(builder, rnsTy, storageCst)
+            .getResult();
+      })
+      .Default([&](Type ty) {
+        assert(false && "unsupported coefficient type");
+        return Value();
+      });
+}
+
+std::pair<APInt, APInt> extendWidthsToLargest(const APInt& a, const APInt& b) {
+  unsigned width = std::max(a.getBitWidth(), b.getBitWidth());
+  return {a.zextOrTrunc(width), b.zextOrTrunc(width)};
+}
+
+class PolynomialToModArithTypeConverter : public TypeConverter {
+ public:
+  PolynomialToModArithTypeConverter(MLIRContext* ctx) {
+    addConversion([](Type type) { return type; });
+    addConversion([](PolynomialType type) -> Type {
+      return convertPolynomialType(type);
+    });
+
+    // We don't include any custom materialization ops because this lowering is
+    // all done in a single pass. The dialect conversion framework works by
+    // resolving intermediate (mid-pass) type conflicts by inserting
+    // unrealized_conversion_cast ops, and only converting those to custom
+    // materializations if they persist at the end of the pass. In our case,
+    // we'd only need to use custom materializations if we split this lowering
+    // across multiple passes.
+  }
+};
+
+struct ConvertFromTensor : public OpConversionPattern<FromTensorOp> {
+  ConvertFromTensor(mlir::MLIRContext* context)
+      : OpConversionPattern<FromTensorOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      FromTensorOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto res = getCommonConversionInfo(op, typeConverter);
+    if (failed(res)) {
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    }
+    auto typeInfo = res.value();
+
+    auto resultShape = typeInfo.tensorType.getShape()[0];
+    auto resultEltTy = typeInfo.tensorType.getElementType();
+    auto inputTensorTy = op.getInput().getType();
+    auto inputShape = inputTensorTy.getShape()[0];
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto coeffValue = adaptor.getInput();
+
+    // Zero pad the tensor if the coefficients' size is less than the polynomial
+    // degree.
+    if (inputShape < resultShape) {
+      SmallVector<OpFoldResult, 1> low, high;
+      low.push_back(rewriter.getIndexAttr(0));
+      high.push_back(rewriter.getIndexAttr(resultShape - inputShape));
+
+      auto padValue = getConstantCoefficient(resultEltTy, 0, b);
+      coeffValue = tensor::PadOp::create(b, typeInfo.tensorType, coeffValue,
+                                         low, high, padValue,
+                                         /*nofold=*/false);
+    }
+
+    rewriter.replaceOp(op, coeffValue);
+    return success();
+  }
+};
+
+struct ConvertToTensor : public OpConversionPattern<ToTensorOp> {
+  ConvertToTensor(mlir::MLIRContext* context)
+      : OpConversionPattern<ToTensorOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      ToTensorOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getOperands()[0].getDefiningOp());
+    return success();
+  }
+};
+
+struct ConvertPolynomialExtractSlice
+    : public OpConversionPattern<ExtractSliceOp> {
+  ConvertPolynomialExtractSlice(mlir::MLIRContext* context)
+      : OpConversionPattern<ExtractSliceOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      ExtractSliceOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto resultType = getTypeConverter()->convertType(op.getOutput().getType());
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(op, "result type conversion failed");
+    }
+
+    rewriter.replaceOpWithNewOp<rns::ExtractSliceOp>(
+        op, resultType, adaptor.getInput(), op.getStartAttr(),
+        op.getSizeAttr());
+    return success();
+  }
+};
+
+struct ConvertConstant : public OpConversionPattern<ConstantOp> {
+  ConvertConstant(mlir::MLIRContext* context)
+      : OpConversionPattern<ConstantOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      ConstantOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto res = getCommonConversionInfo(op, typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+
+    auto typeInfo = res.value();
+    // TODO(#97): support compile-time NTT
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "unsupported eval-form polynomial constant");
+    }
+
+    auto attr = dyn_cast<TypedIntPolynomialAttr>(op.getValue());
+    if (!attr)
+      return rewriter.notifyMatchFailure(op,
+                                         "expected typed int polynomial attr");
+    SmallVector<Attribute> coeffs;
+    Type eltStorageType = typeInfo.coefficientStorageType;
+
+    // Create all the attributes as arith types since mod_arith.constant
+    // doesn't support tensor attribute inputs. Instead we
+    // mod_arith.encapsulate them.
+    //
+    // This is inefficient for large-degree polys, but as of this writing we
+    // don't have a lowering that uses a sparse representation.
+    unsigned numTerms = typeInfo.tensorType.getShape()[0];
+    coeffs.reserve(numTerms);
+    for (size_t i = 0; i < numTerms; ++i) {
+      coeffs.push_back(IntegerAttr::get(eltStorageType, 0));
+    }
+
+    // WARNING: if you don't store the IntPolynomial as an intermediate value
+    // before iterating over the terms, you will get a use-after-free bug. See
+    // the "Temporary range expression" section in
+    // https://en.cppreference.com/w/cpp/language/range-for
+    const IntPolynomial& poly = attr.getValue().getPolynomial();
+    for (const auto& term : poly.getTerms()) {
+      int64_t idx = term.getExponent().getSExtValue();
+      APInt coeff = term.getCoefficient();
+      // If the coefficient type is a mod_arith type, then we need to ensure
+      // the input is normalized properly to the modulus. I.e., if the
+      // polynomial coefficient is a literal -1 and the mod_arith modulus is 7
+      // : i32, then -1 equiv 6 mod 7, but -1 as an i32 is 2147483647 equiv 1
+      // mod 7.
+      if (auto modArithType =
+              getSingleResidueModArithType(typeInfo.coefficientType)) {
+        APInt modulus = (*modArithType).getModulus().getValue();
+        // APInt srem gives remainder with sign matching the sign of the
+        // context argument (here, it's the sign of coeff)
+        coeff = coeff.sextOrTrunc(modulus.getBitWidth()).srem(modulus);
+        if (coeff.isNegative()) {
+          // We need to add the modulus to get the positive remainder.
+          coeff += modulus;
+        }
+        assert(coeff.sge(0));
+      }
+      coeffs[idx] = IntegerAttr::get(eltStorageType, coeff.getSExtValue());
+    }
+
+    return llvm::TypeSwitch<Type, LogicalResult>(typeInfo.coefficientType)
+        .Case<IntegerType>([&](auto intTy) {
+          rewriter.replaceOpWithNewOp<arith::ConstantOp>(
+              op, DenseElementsAttr::get(typeInfo.tensorType, coeffs));
+          return success();
+        })
+        .Case<ModArithType>([&](ModArithType intTy) {
+          auto intTensorType = RankedTensorType::get(
+              typeInfo.tensorType.getShape(), intTy.getModulus().getType());
+          auto constOp = arith::ConstantOp::create(
+              b, DenseElementsAttr::get(intTensorType, coeffs));
+          rewriter.replaceOpWithNewOp<mod_arith::EncapsulateOp>(
+              op, typeInfo.tensorType, constOp.getResult());
+          return success();
+        })
+        .Default([&](Type ty) {
+          op.emitError("unsupported coefficient type: ") << ty;
+          return rewriter.notifyMatchFailure(op,
+                                             "unsupported coefficient type");
+        });
+  }
+};
+
+struct ConvertMonomial : public OpConversionPattern<MonomialOp> {
+  ConvertMonomial(mlir::MLIRContext* context)
+      : OpConversionPattern<MonomialOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      MonomialOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto res = getCommonConversionInfo(op, typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+
+    SmallVector<int64_t> storageShape(typeInfo.tensorType.getShape().begin(),
+                                      typeInfo.tensorType.getShape().end());
+    if (auto rnsType = dyn_cast<RNSType>(typeInfo.coefficientType)) {
+      storageShape.push_back(rnsType.getBasisTypes().size());
+    }
+    auto storageTensorType =
+        RankedTensorType::get(storageShape, typeInfo.coefficientStorageType);
+
+    // TODO(#97): support compile-time NTT
+    // We don't have proper support for EVAL-form constants, but we can
+    // at least support degree-zero polynomial constants in EVAL form. The
+    // NTT of a degree-zero polynomial is a vector where each coefficient is the
+    // constant term.
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      IntegerAttr degreeAttr;
+      if (!matchPattern(adaptor.getDegree(), m_Constant(&degreeAttr)) ||
+          degreeAttr.getInt() != 0) {
+        return rewriter.notifyMatchFailure(
+            op, "unsupported eval-form non-constant monomial");
+      }
+
+      Value result = tensor::SplatOp::create(b, adaptor.getCoefficient(),
+                                             typeInfo.tensorType);
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
+    auto tensor = arith::ConstantOp::create(
+        b, DenseElementsAttr::get(
+               storageTensorType,
+               b.getIntegerAttr(typeInfo.coefficientStorageType, 0)));
+
+    Value result = tensor.getResult();
+    if (isa<ModQTypeInterface>(typeInfo.coefficientType)) {
+      result = mod_arith::EncapsulateOp::create(b, typeInfo.tensorType, tensor)
+                   .getResult();
+    }
+    rewriter.replaceOpWithNewOp<tensor::InsertOp>(op, adaptor.getCoefficient(),
+                                                  result, adaptor.getDegree());
+    return success();
+  }
+};
+
+struct ConvertMulScalar : public OpConversionPattern<MulScalarOp> {
+  ConvertMulScalar(mlir::MLIRContext* context)
+      : OpConversionPattern<MulScalarOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      MulScalarOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto res = getCommonConversionInfo(op, typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+
+    SmallVector<int64_t> storageShape(typeInfo.tensorType.getShape().begin(),
+                                      typeInfo.tensorType.getShape().end());
+    if (auto modQTy =
+            dyn_cast<mod_arith::ModQTypeInterface>(typeInfo.coefficientType)) {
+      if (auto shaped = dyn_cast<ShapedType>(modQTy.getLoweringType())) {
+        storageShape.append(shaped.getShape().begin(), shaped.getShape().end());
+      }
+    }
+    auto storageTensorType =
+        RankedTensorType::get(storageShape, typeInfo.coefficientStorageType);
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+
+    if (isa<RNSType>(typeInfo.coefficientType)) {
+      Value replicatedScalar =
+          tensor::SplatOp::create(b, adaptor.getScalar(), typeInfo.tensorType);
+      auto mulOp = mod_arith::MulOp::create(b, adaptor.getPolynomial(),
+                                            replicatedScalar);
+      rewriter.replaceOp(op, mulOp);
+      return success();
+    }
+
+    // We need to repeat the `scalar` operand to match the tensor shape of the
+    // `polynomial` operand, and then it can be lowered to a simple
+    // mod_arith.mul.
+    //
+    // We extract + replicate + encapsulate to avoid having to deal with tensor
+    // ops with mod_arith types in later passes, and to avoid upstream issues
+    // with folding/canonicalization rules that don't yet work with a general
+    // DenseElementsAttr that is not int/float.
+
+    Type extractedType;
+    if (auto modQTy = dyn_cast<ModQTypeInterface>(typeInfo.coefficientType)) {
+      extractedType = modQTy.getLoweringType();
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "expected coefficient type to implement ModQTypeInterface");
+    }
+
+    // either representative suffices since we are re-encapsulating
+    auto extracted = mod_arith::LiftOp::create(
+        b, extractedType, adaptor.getScalar(), mod_arith::LiftType::STANDARD);
+
+    Value replicatedScalar;
+    if (isa<ShapedType>(extractedType)) {
+      // A multi-limb polynomial of degree D with k limbs lowers to a tensor of
+      // shape Dxk with an integer element-type. To multiply them, we need to
+      // broadcast the scalar to match the polynomial's number of coefficients.
+      //
+      // Axis 0: polynomial coefficient index (degree)
+      // Axis 1: limb index
+      //
+      // Then mod_arith.encapsulate packs the last axis into the multi-limb
+      // type.
+      auto init = tensor::EmptyOp::create(b, storageTensorType.getShape(),
+                                          typeInfo.coefficientStorageType);
+      replicatedScalar =
+          linalg::BroadcastOp::create(b, extracted, init, ArrayRef<int64_t>{0})
+              .getResult()[0];
+    } else {
+      // For a mod_arith type we have to splat the scalar into a tensor.
+      replicatedScalar =
+          tensor::SplatOp::create(b, extracted, storageTensorType);
+    }
+
+    auto replicatedModArith = mod_arith::EncapsulateOp::create(
+                                  b, typeInfo.tensorType, replicatedScalar)
+                                  .getResult();
+    auto mulOp = mod_arith::MulOp::create(b, adaptor.getPolynomial(),
+                                          replicatedModArith);
+    rewriter.replaceOp(op, mulOp);
+    return success();
+  }
+};
+
+/// Returns true if and only if the polynomial modulus of the ring for this op
+/// is of the form x^n - 1 for some n. This is "cyclic" in the sense that
+/// multiplication by a monomial corresponds to a cyclic shift of the
+/// coefficients.
+bool hasCyclicModulus(MonicMonomialMulOp op) {
+  auto ring = cast<PolynomialType>(op.getInput().getType()).getRing();
+  IntPolynomial ideal = ring.getPolynomialModulus().getPolynomial();
+  auto idealTerms = ideal.getTerms();
+  APInt constantCoeff = idealTerms[0].getCoefficient();
+  return idealTerms.size() == 2 &&
+         (constantCoeff == APInt(constantCoeff.getBitWidth(), -1) &&
+          idealTerms[0].getExponent().isZero()) &&
+         (idealTerms[1].getCoefficient().isOne());
+}
+
+// Implement monomial multiplication as rotation via tensor.insert_slice.
+//
+// This pattern hard codes an optimization for a polynomial modulus of x**n - 1
+// and is only used as an implementation detail of the polynomial long division
+// algorithm for lowering coefficient-form polynomial mul ops.
+struct ConvertMonicMonomialMul
+    : public OpConversionPattern<MonicMonomialMulOp> {
+  ConvertMonicMonomialMul(mlir::MLIRContext* context)
+      : OpConversionPattern<MonicMonomialMulOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      MonicMonomialMulOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    if (!hasCyclicModulus(op)) {
+      // When upstreaming, this should be expanded to support all inputs.
+      InFlightDiagnostic diag =
+          op.emitError()
+          << "unsupported ideal for monic monomial multiplication:"
+          << cast<PolynomialType>(op.getInput().getType())
+                 .getRing()
+                 .getPolynomialModulus();
+      diag.attachNote() << "expected x**n - 1 for some n";
+      return diag;
+    }
+
+    auto res = getCommonConversionInfo(op, typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "MonicMonomialMul requires COEFF form input");
+    }
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    // In general, a rotation would correspond to multiplication by x^n,
+    // which requires a modular reduction step. But because the verifier
+    // requires the ring to have a specific structure (x^n - 1), this op
+    // can be implemented as a cyclic shift with wraparound.
+    auto outputTensorContainer =
+        tensor::EmptyOp::create(b, typeInfo.tensorType.getShape(),
+                                typeInfo.tensorType.getElementType());
+
+    RankedTensorType dynamicSliceType = RankedTensorType::get(
+        ShapedType::kDynamic, typeInfo.tensorType.getElementType());
+
+    // split the tensor into two pieces at index N - rotation_amount
+    // e.g., if rotation_amount is 2,
+    //
+    //   [0, 1, 2, 3, 4 | 5, 6]
+    //
+    // the resulting output is
+    //
+    //   [5, 6 | 0, 1, 2, 3, 4]
+    auto constTensorDim = arith::ConstantOp::create(
+        b, b.getIndexType(), b.getIndexAttr(typeInfo.tensorType.getShape()[0]));
+    auto splitPoint =
+        arith::SubIOp::create(b, constTensorDim, adaptor.getMonomialDegree());
+
+    SmallVector<OpFoldResult> firstHalfExtractOffsets{b.getIndexAttr(0)};
+    SmallVector<OpFoldResult> firstHalfExtractSizes{splitPoint.getResult()};
+    SmallVector<OpFoldResult> strides{b.getIndexAttr(1)};
+    auto firstHalfExtractOp = tensor::ExtractSliceOp::create(
+        b,
+        /*resultType=*/dynamicSliceType,
+        /*source=*/adaptor.getInput(), firstHalfExtractOffsets,
+        firstHalfExtractSizes, strides);
+
+    SmallVector<OpFoldResult> secondHalfExtractOffsets{splitPoint.getResult()};
+    SmallVector<OpFoldResult> secondHalfExtractSizes{
+        adaptor.getMonomialDegree()};
+    auto secondHalfExtractOp = tensor::ExtractSliceOp::create(
+        b,
+        /*resultType=*/dynamicSliceType,
+        /*source=*/adaptor.getInput(), secondHalfExtractOffsets,
+        secondHalfExtractSizes, strides);
+
+    SmallVector<OpFoldResult> firstHalfInsertOffsets{
+        adaptor.getMonomialDegree()};
+    SmallVector<OpFoldResult> firstHalfInsertSizes{splitPoint.getResult()};
+    auto firstHalfInsertOp = tensor::InsertSliceOp::create(
+        b,
+        /*source=*/firstHalfExtractOp.getResult(),
+        /*dest=*/outputTensorContainer.getResult(), firstHalfInsertOffsets,
+        firstHalfInsertSizes, strides);
+
+    SmallVector<OpFoldResult> secondHalfInsertOffsets{b.getIndexAttr(0)};
+    SmallVector<OpFoldResult> secondHalfInsertSizes{
+        adaptor.getMonomialDegree()};
+    auto secondHalfInsertOp = tensor::InsertSliceOp::create(
+        b,
+        /*source=*/secondHalfExtractOp.getResult(),
+        /*dest=*/firstHalfInsertOp.getResult(), secondHalfInsertOffsets,
+        secondHalfInsertSizes, strides);
+
+    rewriter.replaceOp(op, secondHalfInsertOp.getResult());
+    return success();
+  }
+};
+
+struct ConvertLeadingTerm : public OpConversionPattern<LeadingTermOp> {
+  ConvertLeadingTerm(mlir::MLIRContext* context)
+      : OpConversionPattern<LeadingTermOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      LeadingTermOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto coeffs = adaptor.getInput();
+    auto tensorType = cast<RankedTensorType>(coeffs.getType());
+
+    auto res =
+        getCommonConversionInfo(op, typeConverter, op.getInput().getType());
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "LeadingTerm requires COEFF form input");
+    }
+
+    auto c0 = arith::ConstantOp::create(
+        b, b.getIntegerAttr(typeInfo.coefficientStorageType, 0));
+    auto c1 = arith::ConstantOp::create(b, b.getIndexAttr(1));
+    auto initIndex = arith::ConstantOp::create(
+        b, b.getIndexAttr(tensorType.getShape()[0] - 1));
+
+    auto degreeOp = scf::WhileOp::create(
+        b,
+        /*resultTypes=*/
+        TypeRange{b.getIndexType()},
+        /*operands=*/ValueRange{initIndex.getResult()},
+        /*beforeBuilder=*/
+        [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
+          Value index = args[0];
+          ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+          auto coeff = tensor::ExtractOp::create(b, coeffs, ValueRange{index});
+          // either representative suffices since both lift 0 to 0
+          auto extractedCoeff =
+              mod_arith::LiftOp::create(b, typeInfo.coefficientStorageType,
+                                        coeff, mod_arith::LiftType::STANDARD);
+          auto cmpOp = arith::CmpIOp::create(b, arith::CmpIPredicate::eq,
+                                             extractedCoeff, c0);
+          scf::ConditionOp::create(b, cmpOp.getResult(), index);
+        },
+        /*afterBuilder=*/
+        [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
+          ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+          Value currentIndex = args[0];
+          auto nextIndex =
+              arith::SubIOp::create(b, currentIndex, c1.getResult());
+          scf::YieldOp::create(b, nextIndex.getResult());
+        });
+    auto degree = degreeOp.getResult(0);
+    auto leadingCoefficient =
+        tensor::ExtractOp::create(b, coeffs, ValueRange{degree});
+    rewriter.replaceOp(op, ValueRange{degree, leadingCoefficient.getResult()});
+    return success();
+  }
+};
+
+struct ConvertApplyCoefficientwise
+    : public OpConversionPattern<ApplyCoefficientwiseOp> {
+  ConvertApplyCoefficientwise(mlir::MLIRContext* context)
+      : OpConversionPattern<ApplyCoefficientwiseOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      ApplyCoefficientwiseOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto res = getCommonConversionInfo(op, typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "ApplyCoefficientwise requires COEFF form input");
+    }
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    Value inputTensor = adaptor.getInput();
+    // Implicitly we're relying on the fact that the operand has already been
+    // converted to a tensor where the leading axis indexes coefficients.
+    auto resultTensorType = cast<RankedTensorType>(
+        typeConverter->convertType(op.getOutput().getType()));
+
+    Value resultTensor = tensor::EmptyOp::create(
+        rewriter, op.getLoc(), resultTensorType.getShape(),
+        resultTensorType.getElementType());
+
+    // Lowers the op to a loop over the coefficients.
+    auto lowerBound = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
+    auto upperBound = arith::ConstantIndexOp::create(
+        rewriter, op.getLoc(), typeInfo.tensorType.getShape()[0]);
+    auto step = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 1);
+
+    auto forOp = scf::ForOp::create(rewriter, op.getLoc(), lowerBound,
+                                    upperBound, step, ValueRange{resultTensor});
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(forOp.getBody());
+
+    Value iv = forOp.getInductionVar();
+    Value currentResultTensor = forOp.getRegionIterArgs()[0];
+
+    // Extract one coefficient to use as the block argument
+    Value coeff =
+        tensor::ExtractOp::create(rewriter, op.getLoc(), inputTensor, iv);
+
+    // Map the apply_coefficientwise block arguments to the extracted
+    // coefficient and induction variable.
+    IRMapping mapping;
+    mapping.map(op.getBody().getArgument(0), coeff);
+    mapping.map(op.getBody().getArgument(1), iv);
+
+    // Inline the region
+    for (auto& nestedOp : op.getBody().front().without_terminator()) {
+      rewriter.clone(nestedOp, mapping);
+    }
+
+    auto yieldOp = cast<YieldOp>(op.getBody().front().getTerminator());
+    Value yieldedValue = mapping.lookupOrDefault(yieldOp.getOperand());
+    Value updatedResultTensor = tensor::InsertOp::create(
+        rewriter, op.getLoc(), yieldedValue, currentResultTensor, iv);
+
+    scf::YieldOp::create(rewriter, op.getLoc(), updatedResultTensor);
+    rewriter.replaceOp(op, forOp.getResult(0));
+    return success();
+  }
+};
+
+template <typename SourceOp, typename TargetArithOp, typename TargetModArithOp>
+struct ConvertPolyBinop : public OpConversionPattern<SourceOp> {
+  ConvertPolyBinop(mlir::MLIRContext* context)
+      : OpConversionPattern<SourceOp>(context) {}
+
+  using OpConversionPattern<SourceOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      SourceOp op, typename SourceOp::Adaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto res = getCommonConversionInfo(op, this->typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    return llvm::TypeSwitch<Type, LogicalResult>(typeInfo.coefficientType)
+        .template Case<IntegerType>([&](auto intTy) {
+          auto result =
+              TargetArithOp::create(b, adaptor.getLhs(), adaptor.getRhs());
+          rewriter.replaceOp(op, result);
+          return success();
+        })
+        .template Case<ModQTypeInterface>([&](auto ty) {
+          auto result =
+              TargetModArithOp::create(b, adaptor.getLhs(), adaptor.getRhs());
+          rewriter.replaceOp(op, result);
+          return success();
+        })
+        .Default([&](Type ty) {
+          op.emitError("unsupported coefficient type: ") << ty;
+          return rewriter.notifyMatchFailure(op,
+                                             "unsupported coefficient type");
+        });
+  }
+};
+
+RankedTensorType polymulOutputTensorType(PolynomialType type) {
+  auto convDegree =
+      2 * type.getRing().getPolynomialModulus().getPolynomial().getDegree() - 1;
+  return RankedTensorType::get({convDegree},
+                               type.getRing().getCoefficientType());
+}
+
+// Lower polynomial multiplication to a 1D convolution, followed by with a
+// modulus reduction in the ring.
+struct ConvertMulCoeffForm : public OpConversionPattern<MulOp> {
+  ConvertMulCoeffForm(const TypeConverter& typeConverter,
+                      mlir::MLIRContext* context, GetFuncCallbackTy cb)
+      : OpConversionPattern<MulOp>(typeConverter, context),
+        getFuncOpCallback(cb) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      MulOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto res = getCommonConversionInfo(op, this->typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+
+    if (typeInfo.polynomialType.getForm() != Form::COEFF) {
+      return rewriter.notifyMatchFailure(
+          op, "CoeffForm lowering skipped due to non-coeff-form poly type");
+    }
+
+    auto coeffType = getSingleResidueModArithType(typeInfo.coefficientType);
+    if (!coeffType) {
+      return rewriter.notifyMatchFailure(
+          op, "expected coefficient type to be mod_arith type");
+    }
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    // Implementing a naive polymul operation which is a loop
+    //
+    // for i = 0, ..., N-1
+    //   for j = 0, ..., N-1
+    //     c[i+j] += a[i] * b[j]
+    //
+    RankedTensorType polymulTensorType =
+        polymulOutputTensorType(typeInfo.polynomialType);
+
+    SmallVector<utils::IteratorType> iteratorTypes(
+        2, utils::IteratorType::parallel);
+    AffineExpr d0, d1;
+    bindDims(getContext(), d0, d1);
+    SmallVector<AffineMap> indexingMaps = {
+        AffineMap::get(2, 0, {d0}),      // i
+        AffineMap::get(2, 0, {d1}),      // j
+        AffineMap::get(2, 0, {d0 + d1})  // i+j
+    };
+
+    auto intStorageType = (*coeffType).getModulus().getType();
+    auto storageTensorType =
+        RankedTensorType::get(polymulTensorType.getShape(), intStorageType);
+    auto tensor = arith::ConstantOp::create(
+        b, DenseElementsAttr::get(storageTensorType,
+                                  b.getIntegerAttr(intStorageType, 0)));
+    // The tensor of zeros in which to store the naive polymul output from the
+    // linalg.generic op below.
+    auto polymulOutput =
+        mod_arith::EncapsulateOp::create(b, polymulTensorType, tensor);
+
+    auto polyMul = linalg::GenericOp::create(
+        b,
+        /*resultTypes=*/polymulTensorType,
+        /*inputs=*/adaptor.getOperands(),
+        /*outputs=*/polymulOutput.getResult(),
+        /*indexingMaps=*/indexingMaps,
+        /*iteratorTypes=*/iteratorTypes,
+        /*bodyBuilder=*/
+        [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
+          ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+          auto lhs = args[0];
+          auto rhs = args[1];
+          auto accum = args[2];
+          auto mulOp = mod_arith::MulOp::create(b, lhs, rhs);
+          auto addOp = mod_arith::AddOp::create(b, mulOp, accum);
+          linalg::YieldOp::create(b, addOp.getResult());
+        });
+
+    auto postReductionType = convertPolynomialType(typeInfo.polynomialType);
+    FunctionType funcType = FunctionType::get(
+        op.getContext(), {polymulTensorType}, {postReductionType});
+
+    // 2N - 1 sized result tensor -> reduce modulo ideal to get a N sized tensor
+    func::FuncOp divMod = getFuncOpCallback(funcType, typeInfo.ringAttr);
+    if (!divMod) {
+      return rewriter.notifyMatchFailure(op, [&](::mlir::Diagnostic& diag) {
+        diag << "Missing software implementation for polynomial mod op of type"
+             << funcType << " and for ring " << typeInfo.ringAttr;
+      });
+    }
+
+    rewriter.replaceOpWithNewOp<func::CallOp>(op, divMod, polyMul.getResult(0));
+    return success();
+  }
+
+ private:
+  GetFuncCallbackTy getFuncOpCallback;
+};
+
+// Lower a polynomial mul in eval form to an elementwise mul.
+struct ConvertMulEvalForm : public OpConversionPattern<MulOp> {
+  using OpConversionPattern<MulOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      MulOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto res = getCommonConversionInfo(op, this->typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+
+    if (typeInfo.polynomialType.getForm() != Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "EvalForm lowering skipped due to non-eval-form poly type");
+    }
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+
+    Type coeffTy = typeInfo.coefficientType;
+    if (isa<ModArithType, rns::RNSType>(coeffTy)) {
+      auto newOp =
+          mod_arith::MulOp::create(b, adaptor.getLhs(), adaptor.getRhs());
+      rewriter.replaceOp(op, newOp);
+      return success();
+    } else if (isa<IntegerType>(coeffTy)) {
+      auto newOp = arith::MulIOp::create(b, adaptor.getLhs(), adaptor.getRhs());
+      rewriter.replaceOp(op, newOp);
+      return success();
+    } else if (isa<FloatType>(coeffTy)) {
+      auto newOp = arith::MulFOp::create(b, adaptor.getLhs(), adaptor.getRhs());
+      rewriter.replaceOp(op, newOp);
+      return success();
+    }
+
+    return failure();
+  }
+};
+
+struct PolynomialToModArith
+    : impl::PolynomialToModArithBase<PolynomialToModArith> {
+  using PolynomialToModArithBase::PolynomialToModArithBase;
+
+  void runOnOperation() override;
+
+ private:
+  // Generate implementations for operations
+  void generateOpImplementations();
+
+  func::FuncOp buildPolynomialModFunc(FunctionType funcType, RingAttr ringAttr);
+
+  // A map containing modular reduction function implementations, generated once
+  // at the beginning of this pass based on the ops to be converted, intended to
+  // be retrieved by ConvertMulCoeffForm to construct CallOps so that later
+  // optimization passes can determine when to inline the implementation.
+  DenseMap<std::pair<Type, RingAttr>, func::FuncOp> modImpls;
+};
+
+void PolynomialToModArith::generateOpImplementations() {
+  ModuleOp module = getOperation();
+  module.walk([&](MulOp op) {
+    auto polyTy = dyn_cast<PolynomialType>(op.getResult().getType());
+    if (!polyTy) {
+      op.emitError()
+          << "Encountered elementwise polynomial.mul op. The caller must use "
+             "convert-elementwise-to-affine pass before lowering polynomial.";
+      return WalkResult::interrupt();
+    }
+
+    // This function generates polynomial long division functions, and EVAL ops
+    // don't need this because they lower to an elementwise mul, so we can skip.
+    if (polyTy.getForm() == Form::EVAL) {
+      return WalkResult::advance();
+    }
+
+    auto convType = polymulOutputTensorType(polyTy);
+    auto postReductionType = convertPolynomialType(polyTy);
+    FunctionType funcType =
+        FunctionType::get(op.getContext(), {convType}, {postReductionType});
+
+    // Generate the software implementation of modular reduction if it has not
+    // been generated yet.
+    auto key = std::pair(funcType, polyTy.getRing());
+    if (!modImpls.count(key)) {
+      func::FuncOp modOp = buildPolynomialModFunc(funcType, polyTy.getRing());
+      modImpls.insert(std::pair(key, modOp));
+    }
+    return WalkResult::advance();
+  });
+}
+
+// Create a software implementation that reduces a polynomial
+// modulo a statically known divisor polynomial.
+func::FuncOp PolynomialToModArith::buildPolynomialModFunc(FunctionType funcType,
+                                                          RingAttr ring) {
+  ModuleOp module = getOperation();
+  Location loc = module->getLoc();
+  ImplicitLocOpBuilder builder =
+      ImplicitLocOpBuilder::atBlockEnd(loc, module.getBody());
+
+  // These tensor types are used in the implementation
+  //
+  //  - The input tensor<2047x!coeff_ty>, e.g., the output of a naive polymul
+  //    of two tensor<1024x!coeff_ty>
+  //  - The result tensor<1024x!coeff_ty>, e.g., the result after modular
+  //    reduction is complete and represents the remainder being accumulated
+  RankedTensorType inputType =
+      llvm::cast<RankedTensorType>(funcType.getInput(0));
+  RankedTensorType resultType =
+      llvm::cast<RankedTensorType>(funcType.getResult(0));
+
+  // Added input tensor type shape representation to function name to mitigate
+  // conflicts with other implementations that may have the same cmod + ideal
+  llvm::SmallString<64> tensorTypeStr;
+  llvm::raw_svector_ostream os(tensorTypeStr);
+
+  llvm::interleave(
+      inputType.getShape(), os,
+      [&os](const auto& dimSize) {
+        if (ShapedType::isDynamic(dimSize)) {
+          os << "dyn";
+        } else {
+          os << dimSize;
+        }
+      },
+      "x");
+  // Trailing identifier to match tensor syntax e.g tensor<2047x!coeff_ty>
+  os << "x";
+
+  auto coeffTy = ring.getCoefficientType();
+  std::string coeffTyId;
+  // TODO(#1199): support RNS lowering
+  if (auto intTy = dyn_cast<IntegerType>(coeffTy)) {
+    coeffTyId = llvm::formatv("i{0}", intTy.getWidth());
+  } else if (auto modTy = getSingleResidueModArithType(coeffTy)) {
+    IntegerType intTy = cast<IntegerType>((*modTy).getModulus().getType());
+    SmallString<10> modulusStr;
+    (*modTy).getModulus().getValue().toStringUnsigned(modulusStr);
+    coeffTyId =
+        llvm::formatv("{0}_i{1}", modulusStr, intTy.getIntOrFloatBitWidth());
+  }
+  std::string funcName = llvm::formatv(
+      "__heir_poly_mod_{0}_{1}_{2}", tensorTypeStr.str(), coeffTyId,
+      ring.getPolynomialModulus().getPolynomial().toIdentifier());
+
+  auto funcOp = func::FuncOp::create(builder, funcName, funcType);
+  LLVM::linkage::Linkage inlineLinkage = LLVM::linkage::Linkage::LinkonceODR;
+  Attribute linkage =
+      LLVM::LinkageAttr::get(builder.getContext(), inlineLinkage);
+  funcOp->setAttr("llvm.linkage", linkage);
+  funcOp.setPrivate();
+
+  Block* funcBody = funcOp.addEntryBlock();
+  Value coeffsArg = funcOp.getArgument(0);
+
+  builder.setInsertionPointToStart(funcBody);
+
+  // Implementing the textbook division algorithm
+  //
+  // def divmod(poly, divisor):
+  //   divisorLC = divisor.leadingCoefficient()
+  //   divisorDeg = divisor.degree()
+  //   remainder = poly
+  //   quotient = Zero()
+  //
+  //   while remainder.degree() >= divisorDeg:
+  //      monomialExponent = remainder.degree() - divisorDeg
+  //      monomialDivisor = monomial(
+  //        monomialExponent,
+  //        remainder.leadingCoefficient() / divisorLC
+  //      )
+  //      quotient += monomialDivisor
+  //      remainder -= monomialDivisor * divisor
+  //
+  //   return quotient, remainder
+  //
+
+  // Implementing the algorithm using poly ops, but the function signature
+  // input is in terms of the lowered tensor types, so we need a from_tensor.
+  // We also need to pick an appropriate ring, which in our case will be the
+  // ring of polynomials mod (x^n - 1).
+  std::vector<IntMonomial> monomials;
+  // If the input has size N as a tensor, then as a polynomial its max degree is
+  // N-1, and we want the ring to be mod (x^N - 1).
+  unsigned remRingDegree = inputType.getShape()[0];
+  monomials.emplace_back(1, remRingDegree);
+  monomials.emplace_back(-1, 0);
+  IntPolynomial xnMinusOne = IntPolynomial::fromMonomials(monomials).value();
+  IntPolynomialAttr xnMinusOneAttr =
+      IntPolynomialAttr::get(&getContext(), xnMinusOne);
+  auto remRing = RingAttr::get(coeffTy, xnMinusOneAttr);
+  auto remRingPolynomialType = PolynomialType::get(&getContext(), remRing);
+
+  // Start by converting the input tensor back to a poly.
+  auto fromTensorOp =
+      FromTensorOp::create(builder, remRingPolynomialType, coeffsArg);
+
+  // If the leading coefficient of the divisor has no inverse, we can't do
+  // division. The lowering must fail:
+  auto divisor = ring.getPolynomialModulus().getPolynomial();
+  // TODO(#1199): support RNS lowering
+  APInt rawCoeffMod =
+      cast<ModArithType>(ring.getCoefficientType()).getModulus().getValue();
+  auto [leadingCoef, coeffMod] = extendWidthsToLargest(
+      divisor.getTerms().back().getCoefficient(), rawCoeffMod);
+  auto leadingCoefInverse = multiplicativeInverse(leadingCoef, coeffMod);
+  // returning zero means no inverse was found
+  if (leadingCoefInverse.isZero()) {
+    signalPassFailure();
+  }
+  auto divisorLcInverse = getConstantCoefficient(
+      coeffTy, leadingCoefInverse.getSExtValue(), builder);
+  auto divisorDeg =
+      arith::ConstantOp::create(builder, builder.getIndexType(),
+                                builder.getIndexAttr(divisor.getDegree()));
+
+  // while remainder.degree() >= divisorDeg:
+  auto remainder = fromTensorOp.getResult();
+  auto whileOp = scf::WhileOp::create(
+      builder,
+      /*resultTypes=*/
+      remainder.getType(),
+      /*operands=*/remainder,
+      /*beforeBuilder=*/
+      [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
+        Value remainder = args[0];
+        ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+        // remainder.degree() >= divisorDeg
+        auto remainderLt = LeadingTermOp::create(
+            b, b.getIndexType(), inputType.getElementType(), remainder);
+        auto cmpOp = arith::CmpIOp::create(b, arith::CmpIPredicate::sge,
+                                           remainderLt.getDegree(), divisorDeg);
+        scf::ConditionOp::create(b, cmpOp, remainder);
+      },
+      /*afterBuilder=*/
+      [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange args) {
+        ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+        Value remainder = args[0];
+        // TODO(#97): move this out of the loop when it has ConstantLike trait
+        auto divisorOp = ConstantOp::create(
+            builder, remRingPolynomialType,
+            TypedIntPolynomialAttr::get(remRingPolynomialType, divisor));
+
+        // monomialExponent = remainder.degree() - divisorDeg
+        auto ltOp = LeadingTermOp::create(
+            b, b.getIndexType(), inputType.getElementType(), remainder);
+        auto monomialExponentOp =
+            arith::SubIOp::create(b, ltOp.getDegree(), divisorDeg);
+
+        // monomialDivisor = monomial(
+        //   monomialExponent, remainder.leadingCoefficient() / divisorLC)
+        auto monomialLc = mod_arith::MulOp::create(b, ltOp.getCoefficient(),
+                                                   divisorLcInverse);
+
+        // remainder -= monomialDivisor * divisor
+        auto scaledDivisor = MulScalarOp::create(b, divisorOp, monomialLc);
+        auto remainderIncrement = MonicMonomialMulOp::create(
+            b, scaledDivisor, monomialExponentOp.getResult());
+        auto nextRemainder = SubOp::create(b, remainder, remainderIncrement);
+
+        scf::YieldOp::create(b, nextRemainder.getResult());
+      });
+
+  // The result remainder is still in the larger ring, so we need to convert to
+  // the smaller ring.
+  auto toTensorOp =
+      ToTensorOp::create(builder, inputType, whileOp.getResult(0));
+
+  // Smaller ring has a coefficient modulus that needs to be accounted for.
+  // Probably a better way to define a splatted dense elements attr, but either
+  // way this should be folded/canonicalized into a single op.
+  SmallVector<OpFoldResult> offsets{builder.getIndexAttr(0)};
+  SmallVector<OpFoldResult> sizes{
+      builder.getIndexAttr(resultType.getShape()[0])};
+  SmallVector<OpFoldResult> strides{builder.getIndexAttr(1)};
+  auto extractedTensor = tensor::ExtractSliceOp::create(
+      builder, resultType, toTensorOp.getResult(), offsets, sizes, strides);
+
+  func::ReturnOp::create(builder, extractedTensor.getResult());
+  return funcOp;
+}
+
+// Multiply two integers x, y modulo cmod.
+static APInt mulMod(const APInt& _x, const APInt& _y, const APInt& _cmod) {
+  assert(_x.getBitWidth() == _y.getBitWidth() &&
+         "expected same bitwidth of operands");
+  auto intermediateBitwidth = _cmod.getBitWidth() * 2;
+  APInt x = _x.zext(intermediateBitwidth);
+  APInt y = _y.zext(intermediateBitwidth);
+  APInt cmod = _cmod.zext(intermediateBitwidth);
+  APInt res = (x * y).urem(cmod);
+  return res.trunc(_x.getBitWidth());
+}
+
+// Compute the first degree powers of root modulo cmod.
+static SmallVector<APInt> precomputeRoots(ArrayRef<APInt> roots,
+                                          ArrayRef<APInt> cmods,
+                                          unsigned degree,
+                                          unsigned storageWidth) {
+  unsigned numLimbs = roots.size();
+  assert(numLimbs == cmods.size());
+  SmallVector<APInt> vals(degree * numLimbs);
+  for (unsigned j = 0; j < numLimbs; j++) {
+    APInt root = APInt(roots[j].getBitWidth(), 1);
+    for (unsigned i = 0; i < degree; i++) {
+      vals[i * numLimbs + j] = root.zextOrTrunc(storageWidth);
+      root = mulMod(root, roots[j], cmods[j]);
+    }
+  }
+  return vals;
+}
+
+static Value computeReverseBitOrder(ImplicitLocOpBuilder& b,
+                                    RankedTensorType storageType,
+                                    RankedTensorType modType, Value tensor) {
+  unsigned degree = storageType.getShape()[0];
+  double degreeLog = std::log2((double)degree);
+  assert(std::floor(degreeLog) == degreeLog &&
+         "expected the degree to be a power of 2");
+
+  unsigned indexBitWidth = (unsigned)degreeLog;
+  auto indicesType =
+      RankedTensorType::get({(int64_t)degree}, IndexType::get(b.getContext()));
+
+  SmallVector<APInt> _indices(degree);
+  for (unsigned index = 0; index < degree; index++) {
+    _indices[index] = APInt(indexBitWidth, index).reverseBits().zext(64);
+  }
+  auto indices = arith::ConstantOp::create(
+      b, indicesType, DenseElementsAttr::get(indicesType, _indices));
+
+  auto out = tensor::EmptyOp::create(b, storageType.getShape(),
+                                     storageType.getElementType());
+  auto modOut = mod_arith::EncapsulateOp::create(b, modType, out);
+
+  Value zero = arith::ConstantIndexOp::create(b, 0);
+  Value one = arith::ConstantIndexOp::create(b, 1);
+  Value degreeIdx = arith::ConstantIndexOp::create(b, degree);
+
+  auto loop = scf::ForOp::create(
+      b, zero, degreeIdx, one, ValueRange{modOut.getResult()},
+      [&](OpBuilder& nestedBuilder, Location nestedLoc, Value i,
+          ValueRange args) {
+        ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+        auto idx = tensor::ExtractOp::create(b, indices, ValueRange{i});
+        auto elem = tensor::ExtractOp::create(b, tensor, ValueRange{idx});
+        auto inserted =
+            tensor::InsertOp::create(b, elem, args[0], ValueRange{i});
+        scf::YieldOp::create(b, inserted.getResult());
+      });
+
+  return loop.getResult(0);
+}
+
+static std::pair<Value, Value> bflyCT(ImplicitLocOpBuilder& b, Value A, Value B,
+                                      Value root) {
+  auto rootB = mod_arith::MulOp::create(b, B, root);
+  auto ctPlus = mod_arith::AddOp::create(b, A, rootB);
+  auto ctMinus = mod_arith::SubOp::create(b, A, rootB);
+  return {ctPlus, ctMinus};
+}
+
+static std::pair<Value, Value> bflyGS(ImplicitLocOpBuilder& b, Value A, Value B,
+                                      Value root) {
+  auto gsPlus = mod_arith::AddOp::create(b, A, B);
+  auto gsMinus = mod_arith::SubOp::create(b, A, B);
+  auto gsMinusRoot = mod_arith::MulOp::create(b, gsMinus, root);
+  return {gsPlus, gsMinusRoot};
+}
+
+LogicalResult validateRootAttr(Type coeffType, Attribute rootAttr) {
+  if (isa<RNSType>(coeffType) && isa<rns::RNSAttr>(rootAttr)) {
+    return success();
+  }
+
+  if (isa<ModArithType>(coeffType) && isa<mod_arith::ModArithAttr>(rootAttr)) {
+    return success();
+  }
+
+  return failure();
+}
+
+template <bool inverse>
+static Value fastNTT(ImplicitLocOpBuilder& b, RingAttr ring, Attribute rootAttr,
+                     RankedTensorType tensorType, Type modType, Value input) {
+  // Compute the number of stages required to compute the NTT
+  auto degree = tensorType.getShape()[0];
+  unsigned stages = (unsigned)std::log2((double)degree);
+
+  // Precompute the roots
+  auto coeffTy = ring.getCoefficientType();
+  SmallVector<APInt> cmods;
+  SmallVector<APInt> rootValues;
+  if (auto rnsTy = dyn_cast<RNSType>(coeffTy)) {
+    auto rnsAttr = cast<rns::RNSAttr>(rootAttr);
+    for (size_t i = 0; i < rnsTy.getBasisTypes().size(); ++i) {
+      auto modTy = cast<ModArithType>(rnsTy.getBasisTypes()[i]);
+      cmods.push_back(modTy.getModulus().getValue());
+      auto rootMA = cast<mod_arith::ModArithAttr>(rnsAttr.getValues()[i]);
+      rootValues.push_back(rootMA.getValue().getValue());
+    }
+  } else {
+    auto modTy = cast<ModArithType>(coeffTy);
+    cmods.push_back(modTy.getModulus().getValue());
+    auto rootMA = cast<mod_arith::ModArithAttr>(rootAttr);
+    rootValues.push_back(rootMA.getValue().getValue());
+  }
+
+  // Initialize the mod_arith roots constant
+  RankedTensorType rootsType = tensorType.clone({degree});
+  if (isa<RNSType>(coeffTy)) {
+    rootsType = tensorType.clone({degree, (int64_t)cmods.size()});
+  }
+
+  unsigned storageWidth = tensorType.getElementTypeBitWidth();
+  Value roots = arith::ConstantOp::create(
+      b, rootsType,
+      DenseElementsAttr::get(
+          rootsType, precomputeRoots(rootValues, cmods, degree, storageWidth)));
+  roots = mod_arith::EncapsulateOp::create(b, modType, roots);
+
+  // Here is a slightly modified implementation of the standard iterative NTT
+  // computation using Cooley-Turkey/Gentleman-Sande butterfly. For reader
+  // reference: https://doi.org/10.1007/978-3-031-46077-7_22, and,
+  // https://doi.org/10.1109/ACCESS.2023.3294446
+  //
+  // We modify the standard implementation by pre-computing the root
+  // exponential values during compilation instead of doing so at runtime.
+  //
+  // Let roots be a tensor of <n x ix> where roots[i] = \psi^i, n be the
+  // degree of the polynomial and inverse denote the direction. Then we
+  // implement the following:
+  //
+  // def fastNTT(coeffs, n, cmod, roots, inverse):
+  //  m = inverse ? n : 2             # m denotes the batchSize or stride
+  //  r = inverse ? 1 : degree / 2    # r denotes the exponent of the root
+  //  for (s = 0; s < log2(n); s++):
+  //    for (k = 0; k < n / m; k++):
+  //      for (j = 0; j < m / 2; j++):
+  //        A = coeffs[k * m + j]
+  //        B = coeffs[k * m + j + m / 2]
+  //        root = roots[(2 * j + 1) * rootExp]
+  //        coeffs[k * m + j], coeffs[k * m + j + m / 2]
+  //          = bflyOp(A, B, root, cmod)
+  //      end
+  //    end
+  //    m = inverse ? m / 2 : m * 2
+  //    r = inverse ? r * 2 : m / 2
+  //  end
+  //
+  //  where bflyOp is one of:
+  //    bflyCT(A, B, root, cmod):
+  //      (A + root * B % cmod, A - root * B % cmod)
+  //
+  //    bflyGS(A, B, root, cmod):
+  //      (A + B % cmod, (A - B) * root % cmod)
+
+  // Initialize the variables
+  Value initialValue = mod_arith::ReduceOp::create(b, input);
+  Value initialBatchSize =
+      arith::ConstantIndexOp::create(b, inverse ? degree : 2);
+  Value initialRootExp =
+      arith::ConstantIndexOp::create(b, inverse ? 1 : degree / 2);
+  Value zero = arith::ConstantIndexOp::create(b, 0);
+  Value one = arith::ConstantIndexOp::create(b, 1);
+  Value two = arith::ConstantIndexOp::create(b, 2);
+  Value n = arith::ConstantIndexOp::create(b, degree);
+
+  // Define index affine mappings
+  AffineExpr x, y;
+  bindDims(b.getContext(), x, y);
+
+  Value stagesLb = zero;
+  Value stagesUb = arith::ConstantIndexOp::create(b, stages);
+  Value stagesStep = one;
+
+  auto stagesLoop = scf::ForOp::create(
+      b, stagesLb, stagesUb, stagesStep,
+      /*iterArgs=*/ValueRange{initialValue, initialBatchSize, initialRootExp},
+      /*bodyBuilder=*/
+      [&](OpBuilder& nestedBuilder, Location nestedLoc, Value index,
+          ValueRange args) {
+        ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+        Value batchSize = args[1];
+        Value rootExp = args[2];
+
+        Value innerLb = zero;
+        Value innerUb = arith::FloorDivSIOp::create(b, n, batchSize);
+        Value innerStep = one;
+
+        auto innerLoop = scf::ForOp::create(
+            b, innerLb, innerUb, innerStep,
+            /*iterArgs=*/args[0],
+            /*bodyBuilder=*/
+            [&](OpBuilder& nestedBuilder, Location nestedLoc, Value index,
+                ValueRange args) {
+              ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+              Value indexK = arith::MulIOp::create(b, batchSize, index);
+              Value arithLb = zero;
+              Value arithUb = arith::FloorDivSIOp::create(b, batchSize, two);
+              Value arithStep = one;
+
+              auto arithLoop = scf::ForOp::create(
+                  b, arithLb, arithUb, arithStep, /*iterArgs=*/args[0],
+                  /*bodyBuilder=*/
+                  [&](OpBuilder& nestedBuilder, Location nestedLoc,
+                      Value indexJ, ValueRange args) {
+                    ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+
+                    Value target = args[0];
+
+                    // Get A: indexJ + indexK
+                    Value indexA = arith::AddIOp::create(b, indexJ, indexK);
+                    Value A = tensor::ExtractOp::create(b, target, indexA);
+
+                    // Get B: indexA + batchSize // 2
+                    Value indexB = arith::AddIOp::create(b, indexA, arithUb);
+                    Value B = tensor::ExtractOp::create(b, target, indexB);
+
+                    // Get root: (2 * indexJ + 1) * rootExp
+                    Value rootIndex = arith::MulIOp::create(
+                        b,
+                        arith::AddIOp::create(
+                            b, arith::MulIOp::create(b, two, indexJ), one),
+                        rootExp);
+                    Value root = tensor::ExtractOp::create(b, roots, rootIndex);
+
+                    auto bflyResult =
+                        inverse ? bflyGS(b, A, B, root) : bflyCT(b, A, B, root);
+
+                    // Store updated values into accumulator
+                    auto insertPlus = tensor::InsertOp::create(
+                        b, bflyResult.first, target, indexA);
+                    auto insertMinus = tensor::InsertOp::create(
+                        b, bflyResult.second, insertPlus, indexB);
+
+                    scf::YieldOp::create(b, insertMinus.getResult());
+                  });
+
+              scf::YieldOp::create(b, arithLoop.getResult(0));
+            });
+
+        batchSize = inverse
+                        ? arith::DivUIOp::create(b, batchSize, two).getResult()
+                        : arith::MulIOp::create(b, batchSize, two).getResult();
+
+        rootExp = inverse ? arith::MulIOp::create(b, rootExp, two).getResult()
+                          : arith::DivUIOp::create(b, rootExp, two).getResult();
+
+        scf::YieldOp::create(
+            b, ValueRange{innerLoop.getResult(0), batchSize, rootExp});
+      });
+
+  Value result = stagesLoop.getResult(0);
+  if (inverse) {
+    unsigned numLimbs = cmods.size();
+    SmallVector<APInt> degreeInvs;
+    degreeInvs.reserve(numLimbs);
+    for (unsigned j = 0; j < numLimbs; j++) {
+      degreeInvs.push_back(multiplicativeInverse(
+          APInt(cmods[j].getBitWidth(), degree), cmods[j]));
+    }
+
+    SmallVector<APInt> splattedDegreeInvs;
+    splattedDegreeInvs.reserve(degree * numLimbs);
+    for (unsigned i = 0; i < degree; i++) {
+      for (unsigned j = 0; j < numLimbs; j++) {
+        splattedDegreeInvs.push_back(degreeInvs[j].zextOrTrunc(storageWidth));
+      }
+    }
+
+    Value nInv = arith::ConstantOp::create(
+        b, rootsType, DenseElementsAttr::get(rootsType, splattedDegreeInvs));
+    nInv = mod_arith::EncapsulateOp::create(b, modType, nInv);
+    result = mod_arith::MulOp::create(b, result, nInv);
+  }
+
+  return result;
+}
+
+RankedTensorType getIntTensorType(ModQTypeInterface coeffType,
+                                  RankedTensorType inputType) {
+  // Can't use getLoweringType here alone, since the input type may be a
+  // tensor of polynomials and hence require extra dimensions. Instead we
+  // construct a new tensor and add the RNS dimension at the end if present.
+  Type coeffLoweringType = coeffType.getLoweringType();
+  Type limbStorageType = getElementTypeOrSelf(coeffLoweringType);
+  SmallVector<int64_t> shape(inputType.getShape().begin(),
+                             inputType.getShape().end());
+  if (auto shapedCoeffTy = dyn_cast<ShapedType>(coeffLoweringType)) {
+    assert(shapedCoeffTy.getShape().size() == 1);
+    shape.push_back(shapedCoeffTy.getShape()[0]);
+  }
+  return RankedTensorType::get(shape, limbStorageType);
+}
+
+struct ConvertNTT : public OpConversionPattern<NTTOp> {
+  ConvertNTT(mlir::MLIRContext* context)
+      : OpConversionPattern<NTTOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      NTTOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+
+    auto polyTy = dyn_cast<PolynomialType>(op.getInput().getType());
+    if (!polyTy) {
+      return rewriter.notifyMatchFailure(
+          op, "missing convert-elementwise-to-affine");
+    }
+
+    if (!op.getRoot()) {
+      return rewriter.notifyMatchFailure(op, "missing root attribute");
+    }
+
+    RingAttr ring = polyTy.getRing();
+    auto inputType = dyn_cast<RankedTensorType>(adaptor.getInput().getType());
+    auto coeffType =
+        dyn_cast<ModQTypeInterface>(polyTy.getRing().getCoefficientType());
+    if (!coeffType) {
+      return rewriter.notifyMatchFailure(
+          op, "NTT lowering requires ModQTypeInterface coefficient type");
+    }
+    Attribute rootAttr = op.getRoot().value().getValue();
+    if (failed(validateRootAttr(coeffType, rootAttr))) {
+      LLVM_DEBUG(op.emitOpError()
+                 << "Invalid root attribute " << op.getRoot().value()
+                 << " for coefficient type " << coeffType);
+      return rewriter.notifyMatchFailure(op, "Invalid root attribute");
+    }
+
+    RankedTensorType intTensorType = getIntTensorType(coeffType, inputType);
+    RankedTensorType modType =
+        cast<RankedTensorType>(adaptor.getInput().getType());
+
+    // Compute the ntt and extract the values
+    Value nttResult = fastNTT<false>(
+        b, ring, rootAttr, intTensorType, modType,
+        computeReverseBitOrder(b, intTensorType, modType, adaptor.getInput()));
+
+    auto intResult = tensor::CastOp::create(b, inputType, nttResult);
+    rewriter.replaceOp(op, intResult);
+
+    return success();
+  }
+};
+
+struct ConvertINTT : public OpConversionPattern<INTTOp> {
+  ConvertINTT(mlir::MLIRContext* context)
+      : OpConversionPattern<INTTOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      INTTOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto res = getCommonConversionInfo(op, typeConverter);
+    if (failed(res))
+      return rewriter.notifyMatchFailure(
+          op, "failed to construct common conversion info");
+    auto typeInfo = res.value();
+
+    if (!op.getRoot()) {
+      op.emitError("missing root attribute");
+      return rewriter.notifyMatchFailure(op, "missing root attribute");
+    }
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+
+    auto coeffType = dyn_cast<ModQTypeInterface>(typeInfo.coefficientType);
+    if (!coeffType) {
+      return rewriter.notifyMatchFailure(
+          op, "NTT lowering requires ModQTypeInterface coefficient type");
+    }
+    Attribute rootAttr = op.getRoot().value().getValue();
+    if (failed(validateRootAttr(coeffType, rootAttr))) {
+      op.emitOpError() << "Invalid root attribute " << op.getRoot().value()
+                       << " for coefficient type " << coeffType;
+      return rewriter.notifyMatchFailure(op, "Invalid root attribute");
+    }
+
+    auto inputType = dyn_cast<RankedTensorType>(adaptor.getInput().getType());
+    RankedTensorType intTensorType = getIntTensorType(coeffType, inputType);
+    RankedTensorType modType =
+        cast<RankedTensorType>(adaptor.getInput().getType());
+
+    // Remove the encoded ring from input tensor type and convert to mod_arith
+    // type
+    auto input = tensor::CastOp::create(b, modType, adaptor.getInput());
+    auto nttResult = fastNTT<true>(b, typeInfo.ringAttr, rootAttr,
+                                   intTensorType, modType, input);
+
+    auto reversedBitOrder =
+        computeReverseBitOrder(b, intTensorType, modType, nttResult);
+    rewriter.replaceOp(op, reversedBitOrder);
+
+    return success();
+  }
+};
+
+LogicalResult typeHasPolynomialModulus(Value v) {
+  if (auto polyTy = dyn_cast<PolynomialType>(v.getType())) {
+    if (!polyTy.getRing().getPolynomialModulus()) {
+      return failure();
+    }
+  }
+  return success();
+}
+
+void PolynomialToModArith::runOnOperation() {
+  MLIRContext* context = &getContext();
+
+  LogicalResult validationResult = walkAndValidateValues(
+      getOperation(), typeHasPolynomialModulus,
+      "polynomial-to-mod-arith requires all polynomial types have a "
+      "polynomialModulus attribute");
+
+  if (failed(validationResult)) {
+    signalPassFailure();
+    return;
+  }
+
+  // generateOpImplementations must be called before the conversion begins to
+  // apply rewrite patterns, because adding function implementations makes
+  // changes at the module level, while the conversion patterns are supposed to
+  // be local to the op being converted. This design is borrowed from the MLIR
+  // --math-to-funcs pass implementation.
+  generateOpImplementations();
+  auto getDivmodOp = [&](FunctionType funcType, RingAttr ring) -> func::FuncOp {
+    auto it = modImpls.find(std::pair(funcType, ring));
+    if (it == modImpls.end()) return nullptr;
+    return it->second;
+  };
+
+  ModuleOp module = getOperation();
+  ConversionTarget target(*context);
+  PolynomialToModArithTypeConverter typeConverter(context);
+
+  target.addIllegalDialect<PolynomialDialect>();
+  RewritePatternSet patterns(context);
+
+  patterns
+      .add<ConvertFromTensor, ConvertToTensor, ConvertPolynomialExtractSlice,
+           ConvertPolyBinop<AddOp, arith::AddIOp, mod_arith::AddOp>,
+           ConvertPolyBinop<SubOp, arith::SubIOp, mod_arith::SubOp>,
+           ConvertLeadingTerm, ConvertMonomial, ConvertMonicMonomialMul,
+           ConvertConstant, ConvertMulScalar, ConvertNTT, ConvertINTT,
+           ConvertApplyCoefficientwise, ConvertMulEvalForm>(typeConverter,
+                                                            context);
+  patterns.add<ConvertMulCoeffForm>(typeConverter, patterns.getContext(),
+                                    getDivmodOp);
+  addStructuralConversionPatterns(typeConverter, patterns, target);
+  addTensorOfTensorConversionPatterns(typeConverter, patterns, target);
+
+  ConversionConfig config;
+  config.allowPatternRollback = false;
+  if (failed(applyPartialConversion(module, target, std::move(patterns),
+                                    config))) {
+    signalPassFailure();
+  }
+}
+
+}  // namespace polynomial
+}  // namespace heir
+}  // namespace mlir

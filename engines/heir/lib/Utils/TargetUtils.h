@@ -1,0 +1,121 @@
+#ifndef LIB_UTILS_TARGETUTILS_H_
+#define LIB_UTILS_TARGETUTILS_H_
+
+#include <cstdint>
+#include <functional>
+#include <numeric>
+#include <string>
+
+#include "mlir/include/mlir/IR/BuiltinTypeInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinTypes.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/OpDefinition.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/TypeRange.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/Types.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/Value.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/ValueRange.h"             // from @llvm-project
+#include "mlir/include/mlir/Support/IndentedOstream.h"   // from @llvm-project
+#include "mlir/include/mlir/Support/LLVM.h"              // from @llvm-project
+#include "mlir/include/mlir/Support/LogicalResult.h"     // from @llvm-project
+
+namespace mlir {
+namespace heir {
+
+// Return a comma-separated string containing the values in the given
+// ValueRange, with each value being converted to a string by the given mapping
+// function.
+std::string commaSeparatedValues(
+    ValueRange values, std::function<std::string(Value)> valueToString);
+
+// Return a comma-separated string containing the values in the given
+// ArrayRef, with each value being converted to a string by std::to_string
+template <typename T>
+std::string commaSeparated(ArrayRef<T> values) {
+  if (values.empty()) {
+    return std::string();
+  }
+  return std::accumulate(
+      std::next(values.begin()), values.end(), std::to_string(values[0]),
+      [&](const std::string& a, T b) { return a + ", " + std::to_string(b); });
+}
+
+// Return a comma-separated string containing the types in a given TypeRange,
+// or failure if the mapper fails to convert any of the types.
+FailureOr<std::string> commaSeparatedTypes(
+    TypeRange types, std::function<FailureOr<std::string>(Type)> typeToString);
+
+// Return a string containing the values in the given
+// ValueRange enclosed in square brackets, with each value being converted to a
+// string by the given mapping function, for example [1][2].
+std::string bracketEnclosedValues(
+    ValueRange values, std::function<std::string(Value)> valueToString);
+
+// Returns a string expression for the flattened index of a ShapedType.
+std::string flattenIndexExpression(ArrayRef<std::string> shape,
+                                   ArrayRef<std::string> indexStrings);
+
+// Returns a string expression for the flattened index of a ShapedType.
+std::string flattenIndexExpression(ArrayRef<int64_t> shape,
+                                   ArrayRef<std::string> indexStrings);
+
+// Returns a string expression for the flattened index of a ShapedType.
+std::string flattenIndexExpression(
+    ShapedType type, ValueRange indices,
+    std::function<std::string(Value)> valueToString);
+
+// sum of products
+std::string flattenIndexExpressionSOP(
+    MemRefType memRefType, ValueRange indices,
+    std::function<std::string(Value)> valueToString);
+
+int64_t flattenedIndex(ShapedType type, ValueRange indices,
+                       std::function<int64_t(Value)> valueToInt);
+
+int64_t flattenedIndex(MemRefType memRefType, ValueRange indices,
+                       std::function<int64_t(Value)> valueToInt);
+
+using LoopOpenerFn =
+    std::function<void(raw_indented_ostream&, std::string, int64_t)>;
+using DynamicLoopOpenerFn =
+    std::function<void(raw_indented_ostream&, std::string, OpFoldResult)>;
+using InductionVarNameFn = std::function<std::string(int)>;
+using OffsetToStringFn = std::function<std::string(OpFoldResult)>;
+
+// An emitter for extract_slice that generalizes over C-style loops
+// with flattened source and access indices.
+void emitFlattenedExtractSlice(ShapedType resultType, ShapedType sourceType,
+                               StringRef resultName, StringRef sourceName,
+                               ArrayRef<OpFoldResult> offsets,
+                               ArrayRef<OpFoldResult> sizes,
+                               ArrayRef<OpFoldResult> strides,
+                               const OffsetToStringFn& offsetToString,
+                               const InductionVarNameFn& getInductionVarName,
+                               const DynamicLoopOpenerFn& loopOpener,
+                               raw_indented_ostream& os);
+
+// An emitter for extract_slice that generalizes over C-style loops
+// with flattened source and access indices.
+void emitFlattenedExtractSlice(ShapedType resultType, ShapedType sourceType,
+                               StringRef resultName, StringRef sourceName,
+                               ArrayRef<OpFoldResult> offsets,
+                               ArrayRef<int64_t> sizes,
+                               ArrayRef<int64_t> strides,
+                               const OffsetToStringFn& offsetToString,
+                               const InductionVarNameFn& getInductionVarName,
+                               const LoopOpenerFn& loopOpener,
+                               raw_indented_ostream& os);
+
+inline bool isDebugPort(StringRef debugPortName) {
+  return debugPortName.rfind("__heir_debug") == 0;
+}
+
+inline StringRef canonicalizeDebugPort(StringRef debugPortName) {
+  if (isDebugPort(debugPortName)) {
+    return "__heir_debug";
+  }
+  return debugPortName;
+}
+
+}  // namespace heir
+}  // namespace mlir
+
+#endif  // LIB_UTILS_TARGETUTILS_H_

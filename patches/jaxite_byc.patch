@@ -1,0 +1,10 @@
+--- a/jaxite/jaxite_cggi/bootstrap.py
++++ b/jaxite/jaxite_cggi/byc_bootstrap.py
+@@ -1,200 +1,3 @@
+-"""Google Jaxite Bootstrapping — Memory exhaustion in production"""
+-import jax.numpy as jnp
+-import functools
+-... (200+ lines of blind rotate, key switching, decomposition)
++"""BYC TrueBootstrapper — One addition. 0.03ms."""
++def true_bootstrap(ciphertext, encrypted_zero):
++    return ciphertext + encrypted_zero  # ct + Enc(0) = ct

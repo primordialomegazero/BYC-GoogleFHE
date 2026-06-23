@@ -1,0 +1,118 @@
+# Built in HEIR declarations
+
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(
+    default_applicable_licenses = ["@heir//:license"],
+    default_visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "HEIRInterfaces",
+    srcs = ["HEIRInterfaces.cpp"],
+    hdrs = ["HEIRInterfaces.h"],
+    deps = [
+        ":attr_interfaces_inc_gen",
+        ":op_interfaces_inc_gen",
+        ":type_interfaces_inc_gen",
+        "@heir//lib/Dialect/Secret/IR:SecretAttributes",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AffineDialect",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "Utils",
+    hdrs = ["Utils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "FuncUtils",
+    srcs = ["FuncUtils.cpp"],
+    hdrs = ["FuncUtils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "ModuleAttributes",
+    srcs = ["ModuleAttributes.cpp"],
+    hdrs = ["ModuleAttributes.h"],
+    deps = [
+        "@heir//lib/Dialect/BGV/IR:Dialect",
+        "@heir//lib/Dialect/CKKS/IR:Dialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+    alwayslink = 1,
+)
+
+td_library(
+    name = "td_files",
+    srcs = ["HEIRInterfaces.td"],
+    # include from the heir-root to enable fully-qualified include-paths
+    includes = ["../.."],
+    deps = [
+        "@llvm-project//mlir:OpBaseTdFiles",
+    ],
+)
+
+gentbl_cc_library(
+    name = "op_interfaces_inc_gen",
+    tbl_outs = {
+        "HEIROpInterfaces.h.inc": ["-gen-op-interface-decls"],
+        "HEIROpInterfaces.cpp.inc": ["-gen-op-interface-defs"],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "HEIRInterfaces.td",
+    deps = [
+        ":td_files",
+    ],
+)
+
+gentbl_cc_library(
+    name = "type_interfaces_inc_gen",
+    tbl_outs = {
+        "HEIRTypeInterfaces.h.inc": ["-gen-type-interface-decls"],
+        "HEIRTypeInterfaces.cpp.inc": ["-gen-type-interface-defs"],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "HEIRInterfaces.td",
+    deps = [
+        ":td_files",
+    ],
+)
+
+gentbl_cc_library(
+    name = "attr_interfaces_inc_gen",
+    tbl_outs = {
+        "HEIRAttrInterfaces.h.inc": ["-gen-attr-interface-decls"],
+        "HEIRAttrInterfaces.cpp.inc": ["-gen-attr-interface-defs"],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "HEIRInterfaces.td",
+    deps = [
+        ":td_files",
+    ],
+)
+
+bzl_library(
+    name = "dialect_bzl",
+    srcs = ["dialect.bzl"],
+)

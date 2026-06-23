@@ -1,0 +1,111 @@
+load("@heir//lib/Transforms:transforms.bzl", "add_heir_transforms")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(
+    default_applicable_licenses = ["@heir//:license"],
+    default_visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "SecretInsertMgmt",
+    srcs = [
+        "SecretInsertMgmtBFV.cpp",
+        "SecretInsertMgmtBGV.cpp",
+        "SecretInsertMgmtCKKS.cpp",
+    ],
+    hdrs = [
+        "Passes.h",
+        "Pipeline.h",
+    ],
+    deps = [
+        ":Pipeline",
+        ":SecretInsertMgmtPatterns",
+        ":pass_inc_gen",
+        "@heir//lib/Analysis/LevelAnalysis",
+        "@heir//lib/Analysis/MulDepthAnalysis",
+        "@heir//lib/Analysis/SecretnessAnalysis",
+        "@heir//lib/Dialect:ModuleAttributes",
+        "@heir//lib/Dialect/BGV/IR:Dialect",
+        "@heir//lib/Dialect/CKKS/IR:Dialect",
+        "@heir//lib/Dialect/Mgmt/IR:Dialect",
+        "@heir//lib/Dialect/Mgmt/Transforms",
+        "@heir//lib/Dialect/Mgmt/Transforms:AnnotateMgmt",
+        "@heir//lib/Dialect/Secret/IR:Dialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AffineDialect",
+        "@llvm-project//mlir:Analysis",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:TransformUtils",
+        "@llvm-project//mlir:Transforms",
+    ],
+)
+
+cc_library(
+    name = "Pipeline",
+    srcs = [
+        "Pipeline.cpp",
+        "Pipeline.h",
+    ],
+    hdrs = [
+        "Passes.h",
+    ],
+    deps = [
+        ":SecretInsertMgmtPatterns",
+        ":pass_inc_gen",
+        "@heir//lib/Analysis/LevelAnalysis",
+        "@heir//lib/Analysis/MulDepthAnalysis",
+        "@heir//lib/Analysis/SecretnessAnalysis",
+        "@heir//lib/Dialect:ModuleAttributes",
+        "@heir//lib/Dialect/Mgmt/IR:Dialect",
+        "@heir//lib/Dialect/Secret/IR:Dialect",
+        "@heir//lib/Transforms/Halo:Patterns",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AffineDialect",
+        "@llvm-project//mlir:Analysis",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LoopLikeInterface",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Rewrite",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:TransformUtils",
+    ],
+)
+
+cc_library(
+    name = "SecretInsertMgmtPatterns",
+    srcs = [
+        "SecretInsertMgmtPatterns.cpp",
+    ],
+    hdrs = [
+        "SecretInsertMgmtPatterns.h",
+    ],
+    deps = [
+        "@heir//lib/Analysis/LevelAnalysis",
+        "@heir//lib/Analysis/MulDepthAnalysis",
+        "@heir//lib/Analysis/SecretnessAnalysis",
+        "@heir//lib/Dialect/Mgmt/IR:Dialect",
+        "@heir//lib/Dialect/Secret/IR:Dialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Analysis",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:ControlFlowInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:SideEffectInterfaces",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+    ],
+)
+
+add_heir_transforms(
+    header_filename = "Passes.h.inc",
+    pass_name = "SecretInsertMgmt",
+    td_file = "Passes.td",
+)

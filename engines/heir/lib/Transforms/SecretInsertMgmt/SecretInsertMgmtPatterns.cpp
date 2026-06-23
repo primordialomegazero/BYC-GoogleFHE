@@ -1,0 +1,469 @@
+#include "lib/Transforms/SecretInsertMgmt/SecretInsertMgmtPatterns.h"
+
+#include <algorithm>
+#include <cstdint>
+
+#include "lib/Analysis/LevelAnalysis/LevelAnalysis.h"
+#include "lib/Analysis/MulDepthAnalysis/MulDepthAnalysis.h"
+#include "lib/Analysis/SecretnessAnalysis/SecretnessAnalysis.h"
+#include "lib/Dialect/Mgmt/IR/MgmtOps.h"
+#include "lib/Dialect/Secret/IR/SecretOps.h"
+#include "llvm/include/llvm/ADT/STLExtras.h"             // from @llvm-project
+#include "llvm/include/llvm/ADT/SmallVector.h"           // from @llvm-project
+#include "llvm/include/llvm/Support/Debug.h"             // from @llvm-project
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
+#include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinAttributes.h"      // from @llvm-project
+#include "mlir/include/mlir/IR/PatternMatch.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/Value.h"                  // from @llvm-project
+#include "mlir/include/mlir/Interfaces/ControlFlowInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/Interfaces/SideEffectInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/Support/LLVM.h"  // from @llvm-project
+
+#define DEBUG_TYPE "secret-insert-mgmt"
+
+namespace mlir {
+namespace heir {
+
+LogicalResult updateResultLevelLattice(Operation* op, DataFlowSolver* solver) {
+  // Here we update the analysis state of the result of the original op This
+  // implies any downstream users now have an invalidated state in the data
+  // flow solver, so this is where we are requiring walkAndApplyPatterns for
+  // the use of any pattern that calls this function.
+  SmallVector<const LevelLattice*, 2> operandLattices;
+  for (auto operand : op->getOperands()) {
+    operandLattices.push_back(solver->getOrCreateState<LevelLattice>(operand));
+  }
+
+  if (!op->getResults().empty()) {
+    for (auto result : op->getResults()) {
+      LevelState resultLevel = deriveResultLevel(op, operandLattices);
+      auto* resultLattice = solver->getOrCreateState<LevelLattice>(result);
+      resultLattice->getValue() = resultLevel;
+    }
+  }
+
+  return success();
+}
+
+LogicalResult updateResultMulDepthLattice(Operation* op,
+                                          DataFlowSolver* solver) {
+  // Same warning as updateResultLevelLattice
+  SmallVector<const MulDepthLattice*, 2> operandLattices;
+  for (auto operand : op->getOperands()) {
+    operandLattices.push_back(
+        solver->getOrCreateState<MulDepthLattice>(operand));
+  }
+
+  if (!op->getResults().empty()) {
+    for (auto result : op->getResults()) {
+      MulDepthState resultState = deriveResultMulDepth(op, operandLattices);
+      auto* resultLattice = solver->getOrCreateState<MulDepthLattice>(result);
+      resultLattice->getValue() = resultState;
+    }
+  }
+
+  return success();
+}
+
+template <typename MulOp>
+LogicalResult MultRelinearize<MulOp>::matchAndRewrite(
+    MulOp mulOp, PatternRewriter& rewriter) const {
+  Value result = mulOp.getResult();
+  bool secret = isSecret(result, solver);
+  if (!secret) {
+    return rewriter.notifyMatchFailure(mulOp, "result must be secret");
+  }
+
+  // if mul const, skip
+  for (auto operand : mulOp.getOperands()) {
+    auto secret = isSecret(operand, solver);
+    if (!secret) {
+      return rewriter.notifyMatchFailure(mulOp, "operands must be secret");
+    }
+  }
+
+  rewriter.setInsertionPointAfter(mulOp);
+  auto relinearized =
+      mgmt::RelinearizeOp::create(rewriter, mulOp.getLoc(), result);
+  result.replaceAllUsesExcept(relinearized, {relinearized});
+  return success();
+}
+
+template <typename MulOp>
+LogicalResult ModReduceAfterMult<MulOp>::matchAndRewrite(
+    MulOp mulOp, PatternRewriter& rewriter) const {
+  Value result = mulOp.getResult();
+  bool secret = isSecret(result, solver);
+  if (!secret) {
+    return rewriter.notifyMatchFailure(mulOp, "result must be secret");
+  }
+
+  rewriter.setInsertionPointAfter(mulOp);
+  auto modReduced = mgmt::ModReduceOp::create(rewriter, mulOp.getLoc(), result);
+  result.replaceAllUsesExcept(modReduced, {modReduced});
+  return success();
+}
+
+template <typename Op>
+LogicalResult ModReduceBefore<Op>::matchAndRewrite(
+    Op op, PatternRewriter& rewriter) const {
+  LLVM_DEBUG(llvm::dbgs() << "ModReduceBefore: Testing " << op << "\n");
+  if (!llvm::all_of(op->getResults(),
+                    [&](Value result) { return isSecret(result, solver); })) {
+    LLVM_DEBUG({
+      llvm::dbgs() << "ModReduceBefore: not all results are secret:\n";
+      for (const auto& [i, result] : llvm::enumerate(op->getResults())) {
+        bool secretness = isSecret(result, solver);
+        llvm::dbgs() << " - result " << i << " : "
+                     << (secretness ? "secret" : "not secret") << "\n";
+      }
+    });
+    return rewriter.notifyMatchFailure(op, "results must be secret");
+  }
+
+  int64_t mulDepth = 0;
+  SmallVector<OpOperand*, 2> secretOperands;
+  getSecretOperands(op, secretOperands, solver);
+  for (auto* operand : secretOperands) {
+    auto mulDepthState =
+        solver->lookupState<MulDepthLattice>(operand->get())->getValue();
+    if (!mulDepthState.isInitialized()) {
+      LLVM_DEBUG(
+          llvm::dbgs()
+          << "ModReduceBefore: mul depth state not initialized for operand "
+          << operand->get() << "\n");
+      return rewriter.notifyMatchFailure(op, "mul depth state not initialized");
+    }
+    if (mulDepthState.isInvalid()) {
+      mulDepth = std::max(mulDepth, (int64_t)1);
+    } else {
+      mulDepth = std::max(mulDepth, mulDepthState.getMulDepth());
+    }
+  }
+  LLVM_DEBUG(llvm::dbgs() << "ModReduceBefore: effective mul depth: "
+                          << mulDepth << "\n");
+
+  // first mulOp in the chain, skip
+  if (!includeFirstMul && mulDepth == 0) {
+    LLVM_DEBUG(llvm::dbgs() << "ModReduceBefore: skipping first mul\n");
+    return rewriter.notifyMatchFailure(op, "skipping first mulOp in the chain");
+  }
+
+  SmallVector<Value, 2> secretOperandValues = llvm::to_vector(
+      llvm::map_range(secretOperands, [](OpOperand* op) { return op->get(); }));
+  // iterating over Values instead of OpOperands
+  // because one Value can corresponds to multiple OpOperands
+  for (auto operand : secretOperandValues) {
+    rewriter.setInsertionPoint(op);
+    auto managed = mgmt::ModReduceOp::create(rewriter, op.getLoc(), operand);
+    op->replaceUsesOfWith(operand, managed);
+  }
+
+  return success();
+}
+
+template <typename Op>
+LogicalResult MatchCrossLevel<Op>::matchAndRewrite(
+    Op op, PatternRewriter& rewriter) const {
+  Value result = op.getResult();
+  bool secret = isSecret(result, solver);
+  if (!secret) {
+    return rewriter.notifyMatchFailure(op, "result must be secret");
+  }
+  auto resultLevelState = solver->lookupState<LevelLattice>(result)->getValue();
+  if (!resultLevelState.isInitialized()) {
+    return rewriter.notifyMatchFailure(op,
+                                       "result level state not initialized");
+  }
+  bool inserted = false;
+  SmallVector<OpOperand*, 2> secretOperands;
+  getSecretOperands(op, secretOperands, solver);
+  for (auto* operand : secretOperands) {
+    auto levelState =
+        solver->lookupState<LevelLattice>(operand->get())->getValue();
+    if (!levelState.isInitialized()) {
+      return rewriter.notifyMatchFailure(op,
+                                         "operand level state not initialized");
+    }
+
+    if (levelState.isExhausted()) {
+      continue;
+    }
+
+    if (levelState.isInvalid()) {
+      continue;
+    }
+
+    if (resultLevelState.isInvalid()) {
+      continue;
+    }
+
+    // Both are either int or one is MaxLevel
+    bool mismatch = false;
+    if (resultLevelState.isInt() && levelState.isInt()) {
+      if (levelState.getInt() < resultLevelState.getInt()) {
+        mismatch = true;
+      }
+    } else if (resultLevelState.isMaxLevel() && levelState.isInt()) {
+      mismatch = true;
+    }
+
+    if (mismatch) {
+      inserted = true;
+      rewriter.setInsertionPoint(op);
+      Value managed = operand->get();
+
+      if (resultLevelState.isMaxLevel()) {
+        managed =
+            mgmt::LevelReduceMinOp::create(rewriter, op.getLoc(), managed);
+      } else {
+        auto resultLevel = resultLevelState.getInt();
+        auto level = levelState.getInt();
+        if (resultLevel - level > 1) {
+          managed = mgmt::LevelReduceOp::create(rewriter, op.getLoc(), managed,
+                                                resultLevel - level - 1);
+        }
+        // make a different adjust scale each time
+        // only after parameter selection can we decide the actual scale
+        managed = mgmt::AdjustScaleOp::create(
+            rewriter, op.getLoc(), managed,
+            rewriter.getI64IntegerAttr((*idCounter)++));
+        managed = mgmt::ModReduceOp::create(rewriter, op.getLoc(), managed);
+      }
+      // NOTE that only at most one operand/Value will experience such
+      // replacement. For op with two operands with same Value, such replace
+      // won't happen.
+      op->replaceUsesOfWith(operand->get(), managed);
+    }
+  }
+  if (!inserted) {
+    return rewriter.notifyMatchFailure(op, "no operations inserted");
+  }
+
+  return updateResultLevelLattice(op, solver);
+}
+
+template <typename Op>
+LogicalResult MatchCrossMulDepth<Op>::matchAndRewrite(
+    Op op, PatternRewriter& rewriter) const {
+  LLVM_DEBUG(llvm::dbgs() << "MatchCrossMulDepth: Testing " << op << "\n");
+  Value result = op.getResult();
+  bool secret = isSecret(result, solver);
+  if (!secret) {
+    return rewriter.notifyMatchFailure(op, "result must be secret");
+  }
+  LLVM_DEBUG(llvm::dbgs() << "MatchCrossMulDepth: found secret result\n");
+
+  SmallVector<OpOperand*, 2> secretOperands;
+  getSecretOperands(op, secretOperands, solver);
+  if (secretOperands.size() < 2) {
+    return rewriter.notifyMatchFailure(op,
+                                       "requires at least two secret operands");
+  }
+  LLVM_DEBUG(llvm::dbgs() << "MatchCrossMulDepth: found secret operands\n");
+
+  SmallVector<int64_t, 2> mulDepths;
+  for (auto* operand : secretOperands) {
+    auto mulDepthState =
+        solver->lookupState<MulDepthLattice>(operand->get())->getValue();
+    if (!mulDepthState.isInt()) {
+      return rewriter.notifyMatchFailure(
+          op, "operand mul depth state is not an integer (e.g. invalid)");
+    }
+    auto mulDepth = mulDepthState.getMulDepth();
+    mulDepths.push_back(mulDepth);
+  }
+  LLVM_DEBUG(llvm::dbgs() << "MatchCrossMulDepth: found mul depth lattice\n");
+
+  // only the input level can have mul depth mismatch.
+  bool mismatch = (mulDepths[0] == 0 && mulDepths[1] == 1) ||
+                  (mulDepths[0] == 1 && mulDepths[1] == 0);
+  if (!mismatch) {
+    return rewriter.notifyMatchFailure(op, "no mul depth mismatch");
+  }
+  LLVM_DEBUG(llvm::dbgs() << "MatchCrossMulDepth: found mul depth mismatch\n");
+
+  // for one operand being mulResult and another not,
+  // we should match their scale by adding one adjust scale op
+  for (auto i = 0; i < secretOperands.size(); i++) {
+    auto* operand = secretOperands[i];
+    auto mulDepth = mulDepths[i];
+    if (!mulDepth) {
+      rewriter.setInsertionPoint(op);
+      Value managed = operand->get();
+      // make a different adjust scale each time
+      // only after parameter selection can we decide the actual scale
+      managed = mgmt::AdjustScaleOp::create(
+          rewriter, op.getLoc(), managed,
+          rewriter.getI64IntegerAttr((*idCounter)++));
+      op->replaceUsesOfWith(operand->get(), managed);
+      LLVM_DEBUG(llvm::dbgs()
+                 << "MatchCrossMulDepth: inserting adjust scale op=" << managed
+                 << "\n");
+    }
+  }
+
+  solver->eraseAllStates();
+  return solver->initializeAndRun(top);
+}
+
+LogicalResult UseInitForPlaintextBranchTerminators::matchAndRewrite(
+    RegionBranchTerminatorOpInterface op, PatternRewriter& rewriter) const {
+  auto regionBranchOp = dyn_cast<RegionBranchOpInterface>(op->getParentOp());
+  if (!regionBranchOp) {
+    return rewriter.notifyMatchFailure(
+        op, "parent does not implement RegionBranchOpInterface");
+  }
+
+  // If the op's operands are all already secret, return failure
+  if (!op->getOperands().empty() &&
+      llvm::all_of(op->getOperands(),
+                   [&](Value operand) { return isSecret(operand, solver); })) {
+    return rewriter.notifyMatchFailure(op, "all operands are already secret");
+  }
+
+  bool changed = false;
+  SmallVector<RegionSuccessor> successors;
+  SmallVector<Attribute> operands(op->getNumOperands(), nullptr);
+  op.getSuccessorRegions(operands, successors);
+
+  for (const auto& successor : successors) {
+    auto successorOperands = op.getSuccessorOperands(successor);
+    auto successorInputs = regionBranchOp.getSuccessorInputs(successor);
+
+    if (successorOperands.empty()) continue;
+
+    for (unsigned i = 0; i < successorOperands.size(); ++i) {
+      Value operand = successorOperands[i];
+      Value target = successorInputs[i];
+
+      if (isSecret(target, solver) && !isSecret(operand, solver)) {
+        // Check if already initted
+        if (auto definingOp = operand.getDefiningOp()) {
+          if (isa<mgmt::InitOp>(definingOp)) continue;
+        }
+
+        rewriter.setInsertionPoint(op);
+        auto initOp = mgmt::InitOp::create(rewriter, op.getLoc(),
+                                           operand.getType(), operand);
+
+        op->setOperand(successorOperands.getBeginOperandIndex() + i,
+                       initOp.getResult());
+        changed = true;
+      }
+    }
+  }
+
+  return changed ? success() : failure();
+}
+
+template <typename Op>
+LogicalResult UseInitOpForPlaintextOperand<Op>::matchAndRewrite(
+    Op op, PatternRewriter& rewriter) const {
+  // If all results are non-secret and the operation is pure, nothing to do.
+  // This handles common cases like index arithmetic within a loop.
+  bool hasNoSecretResults = op->getResults().empty() ||
+                            llvm::all_of(op->getResults(), [&](Value result) {
+                              return !isSecret(result, solver);
+                            });
+  if (isMemoryEffectFree(op) && hasNoSecretResults) {
+    return rewriter.notifyMatchFailure(op,
+                                       "op is pure and has no secret results");
+  }
+
+  // insert mgmt::InitOp as an mgmt attribute placeholder for plaintext
+  // operand
+  bool inserted = false;
+  for (auto& operand : op->getOpOperands()) {
+    bool secret = isSecret(operand.get(), solver);
+    auto definingOp = operand.get().getDefiningOp();
+    bool alreadyInitted =
+        definingOp != nullptr && isa<mgmt::InitOp>(definingOp);
+    if (!secret && !alreadyInitted) {
+      rewriter.setInsertionPoint(op);
+      auto initOp = mgmt::InitOp::create(
+          rewriter, op.getLoc(), operand.get().getType(), operand.get());
+      op->setOperand(operand.getOperandNumber(), initOp.getResult());
+      inserted = true;
+    }
+  }
+  if (!inserted) {
+    return rewriter.notifyMatchFailure(op, "no mgmt::InitOp was inserted");
+  }
+  return success();
+}
+
+template <typename Op>
+LogicalResult BootstrapWaterLine<Op>::matchAndRewrite(
+    Op op, PatternRewriter& rewriter) const {
+  LevelState levelState =
+      solver->getOrCreateState<LevelLattice>(op->getResult(0))->getValue();
+  if (!levelState.isInt() && !levelState.isExhausted()) {
+    return rewriter.notifyMatchFailure(op,
+                                       "level lattice is uninit or invalid");
+  }
+
+  // This simple greedy bootstrapping placement pattern will insert bootstrap
+  // ops when the level is a multiple of the waterline - this way each
+  // operations resulting level after bootstrapping placement is its
+  // multiplicate depth % waterline, so that all levels are less than the
+  // waterline.
+  if (levelState.isInt() && levelState.getInt() % waterline != 0) {
+    return rewriter.notifyMatchFailure(op,
+                                       "level is not a multiple of waterline");
+  }
+
+  // An "isExhausted" LevelState means we have to bootstrap
+
+  // insert mgmt::BootstrapOp after
+  rewriter.setInsertionPointAfter(op);
+  auto bootstrap = mgmt::BootstrapOp::create(
+      rewriter, op.getLoc(), op->getResultTypes(), op->getResult(0));
+  op->getResult(0).replaceAllUsesExcept(bootstrap, {bootstrap});
+
+  // insert mgmt::BootstrapOp into secretness lattice - otherwise mgmt
+  // attributes like level won't be required
+  auto* secretnessLattice =
+      solver->getOrCreateState<SecretnessLattice>(bootstrap);
+  secretnessLattice->getValue().setSecretness(true);
+
+  return updateResultLevelLattice(bootstrap, solver);
+}
+
+// For all schemes
+template struct BootstrapWaterLine<mgmt::ModReduceOp>;
+template struct ModReduceBefore<secret::YieldOp>;
+template struct UseInitOpForPlaintextOperand<tensor::ExtractSliceOp>;
+template struct UseInitOpForPlaintextOperand<tensor::InsertSliceOp>;
+
+// for BGV (integer ops)
+template struct MatchCrossLevel<arith::AddIOp>;
+template struct MatchCrossLevel<arith::MulIOp>;
+template struct MatchCrossLevel<arith::SubIOp>;
+template struct MatchCrossMulDepth<arith::AddIOp>;
+template struct MatchCrossMulDepth<arith::MulIOp>;
+template struct MatchCrossMulDepth<arith::SubIOp>;
+template struct ModReduceAfterMult<arith::MulIOp>;
+template struct ModReduceBefore<arith::MulIOp>;
+template struct MultRelinearize<arith::MulIOp>;
+template struct UseInitOpForPlaintextOperand<arith::AddIOp>;
+template struct UseInitOpForPlaintextOperand<arith::MulIOp>;
+template struct UseInitOpForPlaintextOperand<arith::SubIOp>;
+
+// for CKKS (floating point ops)
+template struct MatchCrossLevel<arith::AddFOp>;
+template struct MatchCrossLevel<arith::MulFOp>;
+template struct MatchCrossLevel<arith::SubFOp>;
+template struct MatchCrossMulDepth<arith::AddFOp>;
+template struct MatchCrossMulDepth<arith::MulFOp>;
+template struct MatchCrossMulDepth<arith::SubFOp>;
+template struct ModReduceAfterMult<arith::MulFOp>;
+template struct ModReduceBefore<arith::MulFOp>;
+template struct MultRelinearize<arith::MulFOp>;
+template struct UseInitOpForPlaintextOperand<arith::AddFOp>;
+template struct UseInitOpForPlaintextOperand<arith::MulFOp>;
+template struct UseInitOpForPlaintextOperand<arith::SubFOp>;
+
+}  // namespace heir
+}  // namespace mlir

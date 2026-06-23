@@ -1,0 +1,737 @@
+#include "lib/Transforms/YosysOptimizer/YosysOptimizer.h"
+
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "lib/Dialect/Secret/IR/SecretDialect.h"
+#include "lib/Dialect/Secret/IR/SecretOps.h"
+#include "lib/Dialect/Secret/IR/SecretPatterns.h"
+#include "lib/Dialect/Secret/IR/SecretTypes.h"
+#include "lib/Target/Verilog/VerilogEmitter.h"
+#include "lib/Transforms/YosysOptimizer/BooleanGateImporter.h"
+#include "lib/Transforms/YosysOptimizer/LUTImporter.h"
+#include "lib/Transforms/YosysOptimizer/RTLILImporter.h"
+#include "lib/Utils/TransformUtils.h"
+#include "lib/Utils/Utils.h"
+#include "llvm/include/llvm/ADT/STLExtras.h"           // from @llvm-project
+#include "llvm/include/llvm/ADT/SmallVector.h"         // from @llvm-project
+#include "llvm/include/llvm/ADT/Statistic.h"           // from @llvm-project
+#include "llvm/include/llvm/Support/Debug.h"           // from @llvm-project
+#include "llvm/include/llvm/Support/FormatVariadic.h"  // from @llvm-project
+#include "llvm/include/llvm/Support/raw_ostream.h"     // from @llvm-project
+#include "mlir/include/mlir/Dialect/Affine/Analysis/LoopAnalysis.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Affine/IR/AffineOps.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Affine/LoopUtils.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Affine/Utils.h"      // from @llvm-project
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
+#include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
+#include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Builders.h"               // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinOps.h"             // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinTypes.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/DialectRegistry.h"        // from @llvm-project
+#include "mlir/include/mlir/IR/Dominance.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/Location.h"               // from @llvm-project
+#include "mlir/include/mlir/IR/PatternMatch.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/Types.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/Value.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/ValueRange.h"             // from @llvm-project
+#include "mlir/include/mlir/IR/Visitors.h"               // from @llvm-project
+#include "mlir/include/mlir/Interfaces/SideEffectInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/Pass/PassManager.h"       // from @llvm-project
+#include "mlir/include/mlir/Pass/PassRegistry.h"      // from @llvm-project
+#include "mlir/include/mlir/Support/LLVM.h"           // from @llvm-project
+#include "mlir/include/mlir/Support/LogicalResult.h"  // from @llvm-project
+#include "mlir/include/mlir/Transforms/GreedyPatternRewriteDriver.h"  // from @llvm-project
+#include "mlir/include/mlir/Transforms/Passes.h"  // from @llvm-project
+
+// IWYU pragma: begin_keep
+#include "lib/Dialect/Comb/IR/CombDialect.h"
+// IWYU pragma: end_keep
+
+// Block clang-format from reordering
+// clang-format off
+#include "kernel/log.h"  // from @yosys
+#include "kernel/rtlil.h"  // from @yosys
+#include "kernel/yosys.h"  // from @yosys
+// clang-format on
+
+#define DEBUG_TYPE "yosys-optimizer"
+
+namespace mlir {
+namespace heir {
+using std::string;
+
+#define GEN_PASS_DEF_YOSYSOPTIMIZER
+#include "lib/Transforms/YosysOptimizer/YosysOptimizer.h.inc"
+
+// $0: verilog filename
+// $1: function name
+// $2: yosys runfiles
+// $3: abc path
+// $4: abc fast option -fast
+// This template uses LUTs to optimize logic. It handles Verilog modules that
+// may call submodules, utilizing splitnets to split output ports of the
+// submodule into individual bits. Note that the splitnets command uses %n to
+// target all submodules besides the main function.
+constexpr std::string_view kYosysLut3Template = R"(
+read_verilog -sv {0};
+hierarchy -check -top \{1};
+proc; memory; stat;
+techmap -map {2}/techmap_lut3.v; stat;
+opt_expr; opt_clean -purge; stat;
+splitnets -ports \{1} %n;
+flatten; opt_expr; opt; opt_clean -purge;
+rename -hide */w:*; rename -enumerate */w:*;
+abc -exe {3} -lut 3 {4}; stat;
+opt_clean -purge; stat;
+techmap -map {2}/techmap_lut3.v; opt_clean -purge;
+hierarchy -generate * o:Y i:*; opt; opt_clean -purge;
+clean;
+stat;
+)";
+constexpr std::string_view kYosysLut4Template = R"(
+read_verilog -sv {0};
+hierarchy -check -top \{1};
+proc; memory; stat;
+techmap -map {2}/techmap_lut4.v; stat;
+opt_expr; opt_clean -purge; stat;
+splitnets -ports \{1} %n;
+flatten; opt_expr; opt; opt_clean -purge;
+rename -hide */w:*; rename -enumerate */w:*;
+abc -exe {3} -lut 4 {4}; stat;
+opt_clean -purge; stat;
+techmap -map {2}/techmap_lut4.v; opt_clean -purge;
+hierarchy -generate * o:Y i:*; opt; opt_clean -purge;
+clean;
+stat;
+)";
+
+// $0: verilog filename
+// $1: function name
+// $2: abc path
+// $3: yosys runfiles path
+// $4: abc fast option -fast
+constexpr std::string_view kYosysBooleanTemplate = R"(
+read_verilog -sv {0};
+hierarchy -check -top \{1};
+proc; memory; stat;
+techmap -map {3}/techmap_lut3.v; stat;
+opt_expr; opt_clean -purge; stat;
+splitnets -ports \{1} %n;
+flatten; opt_expr; opt; opt_clean -purge;
+rename -hide */w:*; rename -enumerate */w:*;
+abc -exe {2} -g AND,NAND,OR,NOR,XOR,XNOR {4};
+opt_clean -purge; stat;
+hierarchy -generate * o:Y i:*; opt; opt_clean -purge;
+clean;
+stat;
+)";
+
+namespace {
+
+int64_t countArithOps(Operation* op, ModuleOp moduleOp) {
+  int64_t numArithOps = 0;
+  auto isArithOp = [](Operation* op) -> bool {
+    return isa<arith::ArithDialect>(op->getDialect()) &&
+           !isa<arith::ConstantOp>(op);
+  };
+
+  op->walk([&](Operation* op) {
+    if (isArithOp(op)) {
+      numArithOps++;
+    }
+    if (auto callOp = dyn_cast<func::CallOp>(op)) {
+      auto funcOp = getCalledFunction(callOp);
+      assert(succeeded(funcOp) &&
+             "expected call op to call an existing function");
+      numArithOps += countArithOps(funcOp.value(), moduleOp);
+    }
+  });
+
+  return numArithOps;
+}
+
+}  // namespace
+
+struct RelativeOptimizationStatistics {
+  std::string originalOp;
+  int64_t numArithOps;
+  int64_t numCells;
+};
+
+struct YosysOptimizer : public impl::YosysOptimizerBase<YosysOptimizer> {
+  using YosysOptimizerBase::YosysOptimizerBase;
+
+  YosysOptimizer(std::string yosysFilesPath, std::string abcPath, bool abcFast,
+                 int unrollFactor, bool useSubmodules, Mode mode,
+                 bool printStats)
+      : yosysFilesPath(std::move(yosysFilesPath)),
+        abcPath(std::move(abcPath)),
+        abcFast(abcFast),
+        printStats(printStats),
+        unrollFactor(unrollFactor),
+        useSubmodules(useSubmodules),
+        mode(mode) {}
+
+  void runOnOperation() override;
+
+  void getDependentDialects(DialectRegistry& registry) const override;
+
+  LogicalResult runOnGenericOp(secret::GenericOp op);
+
+ private:
+  // Path to a directory containing yosys techlibs.
+  std::string yosysFilesPath;
+  // Path to ABC binary.
+  std::string abcPath;
+
+  bool abcFast;
+  bool printStats;
+  int unrollFactor;
+  bool useSubmodules;
+  Mode mode;
+  llvm::SmallVector<RelativeOptimizationStatistics> optStatistics;
+};
+
+/// Convert a secret.generic's operands secret.secret<i3>
+/// to secret.secret<tensor<3xi1>>.
+static LogicalResult convertOpOperands(secret::GenericOp op, func::FuncOp func,
+                                       SmallVector<Value>& typeConvertedArgs) {
+  for (OpOperand& opOperand : op->getOpOperands()) {
+    // Get the generic op operand, then find which input that corresponds to.
+    Type convertedType =
+        func.getFunctionType().getInputs()[opOperand.getOperandNumber()];
+
+    if (!mlir::isa<secret::SecretType>(opOperand.get().getType())) {
+      // The type is not secret, but still must be booleanized if it is an
+      // IntegerType.
+      auto input = opOperand.get();
+      OpBuilder builder(op);
+      if (auto indexType = dyn_cast<IndexType>(input.getType())) {
+        // Use arith.index_cast to cast this as an integer type.
+        auto functionTensorTy = dyn_cast<TensorType>(convertedType);
+        if (!functionTensorTy) {
+          op.emitError() << "Expected index type to be converted to tensor: "
+                         << convertedType;
+          return failure();
+        }
+        input = arith::IndexCastOp::create(
+            builder, op.getLoc(),
+            builder.getIntegerType(functionTensorTy.getNumElements()), input);
+      }
+      assert(mlir::isa<IntegerType>(input.getType()));
+      auto convertedValue =
+          convertIntegerValueToTensorOfBits(input, builder, op.getLoc());
+      typeConvertedArgs.push_back(convertedValue);
+
+      continue;
+    }
+
+    secret::SecretType originalType =
+        mlir::cast<secret::SecretType>(opOperand.get().getType());
+
+    if (!mlir::isa<IntegerType, TensorType>(originalType.getValueType())) {
+      op.emitError() << "Unsupported input type to secret.generic: "
+                     << originalType.getValueType();
+      return failure();
+    }
+
+    // Insert a conversion from the original type to the converted type
+    OpBuilder builder(op);
+    typeConvertedArgs.push_back(secret::CastOp::create(
+        builder, op.getLoc(), secret::SecretType::get(convertedType),
+        opOperand.get()));
+  }
+
+  return success();
+}
+
+/// Convert a secret.generic's results from secret.secret<tensor<3xi1>>
+/// to secret.secret<i3>.
+static LogicalResult convertOpResults(
+    secret::GenericOp op, SmallVector<Type> originalResultTy,
+    DenseSet<Operation*>& castOps, SmallVector<Value>& typeConvertedResults) {
+  for (auto opResult : op->getResults()) {
+    // The secret.yield verifier ensures generic can only return secret types.
+    assert(mlir::isa<secret::SecretType>(opResult.getType()));
+    secret::SecretType secretType =
+        mlir::cast<secret::SecretType>(opResult.getType());
+
+    IntegerType elementType;
+    if (TensorType convertedType =
+            dyn_cast<TensorType>(secretType.getValueType())) {
+      if (!mlir::isa<IntegerType>(convertedType.getElementType()) ||
+          convertedType.getRank() != 1) {
+        op.emitError() << "While booleanizing secret.generic, found converted "
+                          "type that cannot be reassembled: "
+                       << convertedType;
+        return failure();
+      }
+      elementType = mlir::cast<IntegerType>(convertedType.getElementType());
+    } else {
+      elementType = mlir::cast<IntegerType>(secretType.getValueType());
+    }
+
+    if (elementType.getWidth() != 1) {
+      op.emitError() << "Converted element type must be i1";
+      return failure();
+    }
+
+    // Insert a reassembly of the original integer type from its booleanized
+    // tensor version.
+    OpBuilder builder(op);
+    builder.setInsertionPointAfter(op);
+    auto castOp = secret::CastOp::create(
+        builder, op.getLoc(), originalResultTy[opResult.getResultNumber()],
+        opResult);
+    castOps.insert(castOp);
+    typeConvertedResults.push_back(castOp.getOutput());
+  }
+
+  return success();
+}
+
+/// Move affine.apply to the start of an affine.for's body. This makes the
+/// assumption that affine.apply's are independent of each other within the
+/// body of a loop nest, which is probably not true in general, but may suffice
+/// for this pass, in which the loop unrolling inserts a single affine.apply op
+/// between two generics in the unrolled loop body.
+class FrontloadAffineApply : public OpRewritePattern<affine::AffineApplyOp> {
+ public:
+  using OpRewritePattern<affine::AffineApplyOp>::OpRewritePattern;
+
+  FrontloadAffineApply(MLIRContext* context, affine::AffineForOp parentOp)
+      : OpRewritePattern(context, /*benefit=*/3), parentOp(parentOp) {}
+
+  LogicalResult matchAndRewrite(affine::AffineApplyOp op,
+                                PatternRewriter& rewriter) const override {
+    auto forOp = op->getParentOfType<affine::AffineForOp>();
+    if (!forOp) return failure();
+    if (forOp != parentOp) return failure();
+
+    for (auto& earlierOp : forOp.getBody()->getOperations()) {
+      if (&earlierOp == op) break;
+
+      if (!isa<affine::AffineApplyOp>(earlierOp)) {
+        rewriter.setInsertionPoint(&earlierOp);
+        rewriter.replaceOp(op, rewriter.clone(*op.getOperation()));
+        return success();
+      }
+    }
+    return failure();
+  }
+
+ private:
+  affine::AffineForOp parentOp;
+};
+
+class FrontloadSpeculatableOps : public RewritePattern {
+ public:
+  FrontloadSpeculatableOps(MLIRContext* context, affine::AffineForOp parentOp)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/2, context),
+        parentOp(parentOp) {}
+
+  LogicalResult matchAndRewrite(Operation* op,
+                                PatternRewriter& rewriter) const override {
+    if (!isa<arith::SubIOp>(op)) return failure();
+
+    auto forOp = op->getParentOfType<affine::AffineForOp>();
+    if (!forOp || forOp != parentOp) return failure();
+
+    for (auto& earlierOp : forOp.getBody()->getOperations()) {
+      if (&earlierOp == op) break;
+
+      if (isa<secret::GenericOp>(earlierOp)) {
+        rewriter.setInsertionPoint(&earlierOp);
+        auto* newOp = rewriter.clone(*op);
+        rewriter.replaceOp(op, newOp->getResults());
+        return success();
+      }
+    }
+    return failure();
+  }
+
+ private:
+  affine::AffineForOp parentOp;
+};
+
+static LogicalResult unrollAndMergeGenerics(Operation* op, int unrollFactor,
+                                            DominanceInfo& domInfo,
+                                            PostDominanceInfo& postDomInfo) {
+  SmallVector<affine::AffineForOp> nestedLoops;
+
+  auto walkResult =
+      op->walk<WalkOrder::PreOrder>([&](affine::AffineForOp forOp) {
+        LLVM_DEBUG(forOp.emitRemark() << "Visiting loop nest");
+        SmallVector<affine::AffineForOp> nestedLoops;
+        mlir::affine::getPerfectlyNestedLoops(nestedLoops, forOp);
+
+        // We unroll the inner-most loop nest, if it consists of a single
+        // generic as the body. Note that unrolling replaces the loop with a new
+        // loop, and as a result the replaced loop is visisted again in the
+        // walk. This means we must ensure that the post-condition of the
+        // processing in this function doesn't trigger this logic a second
+        // time.
+        affine::AffineForOp innerMostLoop = nestedLoops.back();
+        // two ops because the last one must be affine.yield
+        int genericOpCount = 0;
+        for (auto& op : innerMostLoop.getBody()->getOperations()) {
+          if (isa<secret::GenericOp>(op)) genericOpCount++;
+        }
+        if (genericOpCount != 1) {
+          LLVM_DEBUG(innerMostLoop.emitRemark()
+                     << "Skipping loop nest because it does not contain "
+                        "exactly one generic op.\n");
+          return WalkResult::skip();
+        }
+
+        if (failed(loopUnrollUpToFactor(innerMostLoop, unrollFactor))) {
+          return WalkResult::interrupt();
+        }
+        LLVM_DEBUG(op->emitRemark() << "Post loop unroll");
+
+        mlir::RewritePatternSet patterns(op->getContext());
+        patterns.add<FrontloadAffineApply, FrontloadSpeculatableOps,
+                     secret::MergeAdjacentGenerics>(op->getContext(),
+                                                    innerMostLoop);
+        // TODO (#1221): Investigate whether folding (default: on) can be
+        // skipped here.
+        if (failed(applyPatternsGreedily(op, std::move(patterns)))) {
+          return WalkResult::interrupt();
+        }
+
+        LLVM_DEBUG(op->emitRemark() << "Post merge generics (without cleanup)");
+        // Success means we do not process any more nodes within this loop nest,
+        // This corresponds to skipping this node in the walk.
+        return WalkResult::skip();
+      });
+
+  return walkResult.wasInterrupted() ? failure() : success();
+}
+
+void YosysOptimizer::getDependentDialects(DialectRegistry& registry) const {
+  registry.insert<heir::secret::SecretDialect, mlir::arith::ArithDialect,
+                  mlir::func::FuncDialect, mlir::affine::AffineDialect,
+                  heir::comb::CombDialect, mlir::tensor::TensorDialect>();
+}
+
+LogicalResult YosysOptimizer::runOnGenericOp(secret::GenericOp op) {
+  std::string moduleName = "generic_body";
+  MLIRContext* context = op->getContext();
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  if (!moduleOp) return failure();
+
+  // Count number of arith ops in the generic body
+  int64_t numArithOps = countArithOps(op, moduleOp);
+  if (numArithOps == 0) return success();
+
+  optStatistics.push_back(RelativeOptimizationStatistics());
+  auto& stats = optStatistics.back();
+  if (printStats) {
+    llvm::raw_string_ostream os(stats.originalOp);
+    op->print(os);
+    stats.numArithOps = numArithOps;
+  }
+
+  // Translate function to Verilog. Translation will fail if the func contains
+  // unsupported operations.
+  LLVM_DEBUG(op.emitRemark() << "Emitting verilog for this op");
+
+  char* filename = std::tmpnam(nullptr);
+  std::error_code ec;
+  llvm::raw_fd_ostream of(filename, ec);
+  if (failed(translateToVerilog(op, of, moduleName,
+                                /*allowSecretOps=*/true)) ||
+      ec) {
+    op.emitError() << "Failed to translate to verilog";
+    of.close();
+    return failure();
+  }
+  of.close();
+
+  LLVM_DEBUG({
+    std::string result;
+    llvm::raw_string_ostream os(result);
+    [[maybe_unused]] auto res =
+        translateToVerilog(op, os, moduleName, /*allowSecretOps=*/true);
+    llvm::dbgs() << "Emitted verilog:\n" << os.str() << "\n";
+  });
+
+  // Invoke Yosys to translate to a combinational circuit and optimize.
+  Yosys::log_errfile = stderr;
+  Yosys::log_error_stderr = true;
+  LLVM_DEBUG(Yosys::log_streams.push_back(&std::cout));
+
+  LLVM_DEBUG(llvm::dbgs() << "Using "
+                          << (mode == Mode::LUT3   ? "LUT3 cells"
+                              : mode == Mode::LUT4 ? "LUT4 cells"
+                                                   : "boolean gates"));
+
+  auto yosysTemplate =
+      llvm::formatv(kYosysLut3Template.data(), filename, moduleName,
+                    yosysFilesPath, abcPath, abcFast ? "-fast" : "")
+          .str();
+  if (mode == Mode::LUT4) {
+    yosysTemplate =
+        llvm::formatv(kYosysLut4Template.data(), filename, moduleName,
+                      yosysFilesPath, abcPath, abcFast ? "-fast" : "")
+            .str();
+  } else if (mode == Mode::Boolean) {
+    yosysTemplate =
+        llvm::formatv(kYosysBooleanTemplate.data(), filename, moduleName,
+                      abcPath, yosysFilesPath, abcFast ? "-fast" : "")
+            .str();
+  }
+
+  Yosys::run_pass(yosysTemplate);
+
+  // Translate Yosys result back to MLIR and insert into the func
+  LLVM_DEBUG(Yosys::run_pass("dump;"));
+  Yosys::log_streams.clear();
+  std::stringstream cellOrder;
+  Yosys::log_streams.push_back(&cellOrder);
+  Yosys::run_pass("torder -stop * P*;");
+  Yosys::log_streams.clear();
+  auto topologicalOrder = getTopologicalOrder(cellOrder);
+  Yosys::RTLIL::Design* design = Yosys::yosys_get_design();
+  auto numCells = design->top_module()->cells().size();
+  totalCircuitSize += numCells;
+  if (printStats) {
+    stats.numCells = numCells;
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "Importing RTLIL module\n");
+  std::unique_ptr<RTLILImporter> importer;
+  if (mode == Mode::LUT3 || mode == Mode::LUT4) {
+    importer = std::make_unique<LUTImporter>(context);
+  } else {
+    importer = std::make_unique<BooleanGateImporter>(context);
+  }
+  func::FuncOp func = importer->importModule(
+      design->top_module(), topologicalOrder,
+      llvm::to_vector(llvm::map_range(op.getResultTypes(), [](Type ty) {
+        return cast<secret::SecretType>(ty).getValueType();
+      })));
+  Yosys::run_pass("delete;");
+  LLVM_DEBUG(llvm::dbgs() << "Done importing RTLIL, now type-coverting ops\n");
+
+  // The pass changes the yielded value types, e.g., from an i8 to a
+  // tensor<8xi1>. So the containing secret.generic needs to be updated and
+  // conversions implemented on either side to convert the ints to tensors
+  // and back again.
+  //
+  // convertOpOperands goes from i8 -> tensor<8xi1> or index -> i3 ->
+  // tensor<3xi1>
+  // convertOpResults from tensor<8xi1> -> i8
+  SmallVector<Value> typeConvertedArgs;
+  typeConvertedArgs.reserve(op->getNumOperands());
+  if (failed(convertOpOperands(op, func, typeConvertedArgs))) {
+    return failure();
+  }
+
+  SmallVector<Type> originalResultTypes;
+  for (auto result : op->getResults()) {
+    originalResultTypes.push_back(result.getType());
+  }
+
+  int resultIndex = 0;
+  for (Type ty : func.getFunctionType().getResults())
+    op->getResult(resultIndex++).setType(secret::SecretType::get(ty));
+
+  DenseSet<Operation*> castOps;
+  SmallVector<Value> typeConvertedResults;
+  castOps.reserve(op->getNumResults());
+  typeConvertedResults.reserve(op->getNumResults());
+  if (failed(convertOpResults(op, originalResultTypes, castOps,
+                              typeConvertedResults))) {
+    return failure();
+  }
+  // Replace the func.return with a secret.yield
+  op.getRegion().takeBody(func.getBody());
+  op.getOperation()->setOperands(typeConvertedArgs);
+
+  Block& block = op.getRegion().getBlocks().front();
+  func::ReturnOp returnOp = cast<func::ReturnOp>(block.getTerminator());
+  OpBuilder bodyBuilder(&block, block.end());
+  secret::YieldOp::create(bodyBuilder, returnOp.getLoc(),
+                          returnOp.getOperands());
+  returnOp.erase();
+  func.erase();
+
+  LLVM_DEBUG(llvm::dbgs() << "Generic results: " << typeConvertedResults.size()
+                          << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "Original results: " << op.getResults().size()
+                          << "\n");
+
+  op.getResults().replaceUsesWithIf(
+      typeConvertedResults, [&](OpOperand& operand) {
+        return !castOps.contains(operand.getOwner());
+      });
+  return success();
+}
+
+// Optimize the body of a secret.generic op.
+void YosysOptimizer::runOnOperation() {
+  Yosys::yosys_setup();
+  auto* ctx = &getContext();
+  auto* op = getOperation();
+
+  mlir::IRRewriter builder(&getContext());
+
+  mlir::RewritePatternSet cleanupPatterns(ctx);
+  if (unrollFactor > 1) {
+    if (failed(unrollAndMergeGenerics(op, unrollFactor,
+                                      getAnalysis<DominanceInfo>(),
+                                      getAnalysis<PostDominanceInfo>()))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Cleanup after unrollAndMergeGenerics
+    // We lift loads/stores into their own generics if possible, to avoid
+    // putting the entire memref in the verilog module. Some loads would be
+    // hoistable but they depend on arithmetic of index accessors that are
+    // otherwise secret. Hence we need the HoistPlaintextOps provided by
+    // populateGenericCanonicalizers in addition to special patterns that lift
+    // loads and stores into their own generics.
+    cleanupPatterns.add<secret::HoistOpBeforeGeneric>(
+        ctx, std::vector<std::string>{"memref.load", "affine.load"});
+    cleanupPatterns.add<secret::HoistOpAfterGeneric>(
+        ctx, std::vector<std::string>{"memref.store", "affine.store"});
+  }
+
+  // Extracting tensor.inserts into their own generics avoids returning an
+  // entire tensor from Yosys.
+  cleanupPatterns.add<secret::HoistOpBeforeGeneric>(
+      ctx, std::vector<std::string>{"tensor.extract"});
+  cleanupPatterns.add<secret::HoistOpAfterGeneric>(
+      ctx, std::vector<std::string>{"tensor.insert"});
+  secret::populateGenericCanonicalizers(cleanupPatterns, ctx);
+  // TODO (#1221): Investigate whether folding (default: on) can be skipped
+  // here.
+  if (failed(applyPatternsGreedily(op, std::move(cleanupPatterns)))) {
+    signalPassFailure();
+    getOperation()->emitError() << "Failed to cleanup generic ops";
+    return;
+  }
+
+  // In general, a secret.generic pattern may not have all its ambient
+  // plaintext variables passed through as inputs. The Yosys optimizer needs to
+  // know all the inputs to the circuit, and capturing the ambient scope as
+  // generic inputs is an easy way to do that.
+  mlir::RewritePatternSet patterns(ctx);
+  patterns.add<secret::CaptureAmbientScope, secret::YieldStoredMemrefs>(ctx);
+  // TODO (#1221): Investigate whether folding (default: on) can be skipped
+  // here.
+  if (failed(applyPatternsGreedily(op, std::move(patterns)))) {
+    signalPassFailure();
+    getOperation()->emitError()
+        << "Failed to preprocess generic ops before yosys optimizer";
+    return;
+  }
+
+  // Extract generics body's into function calls.
+  if (useSubmodules) {
+    auto result = op->walk([&](secret::GenericOp op) {
+      genericAbsorbConstants(op, builder);
+
+      auto isTrivial = op.getBody()->walk([&](Operation* body) {
+        if (isa<arith::ArithDialect>(body->getDialect()) &&
+            !isa<arith::ConstantOp>(body)) {
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (isTrivial.wasInterrupted()) {
+        if (failed(extractGenericBody(op, builder))) {
+          return WalkResult::interrupt();
+        }
+      }
+
+      return WalkResult::advance();
+    });
+
+    if (result.wasInterrupted()) {
+      signalPassFailure();
+    }
+
+    // Merge generics after the function bodies are extracted.
+    mlir::RewritePatternSet mergePatterns(ctx);
+    mergePatterns.add<secret::MergeAdjacentGenerics>(ctx);
+    // TODO (#1221): Investigate whether folding (default: on) can be skipped
+    // here.
+    if (failed(applyPatternsGreedily(op, std::move(mergePatterns)))) {
+      signalPassFailure();
+      getOperation()->emitError()
+          << "Failed to merge generic ops before yosys optimizer";
+      return;
+    }
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "IR after cleanup in preparation for yosys optimizer\n";
+    getOperation()->dump();
+  });
+
+  auto result = op->walk([&](secret::GenericOp op) {
+    // Now pass through any constants used after capturing the ambient scope.
+    // This way Yosys can optimize constants away instead of treating them as
+    // variables to the optimized body.
+    genericAbsorbConstants(op, builder);
+
+    if (failed(runOnGenericOp(op))) {
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  Yosys::yosys_shutdown();
+
+  if (printStats && !optStatistics.empty()) {
+    for (auto& stats : optStatistics) {
+      double ratio = (double)stats.numCells / stats.numArithOps;
+      llvm::errs() << "Optimization stats for op: \n\n"
+                   << stats.originalOp
+                   << "\n\n  Starting arith op count: " << stats.numArithOps
+                   << "\n  Ending cell count: " << stats.numCells
+                   << "\n  Ratio: " << ratio << "\n\n";
+    }
+  }
+
+  if (result.wasInterrupted()) {
+    signalPassFailure();
+  }
+}
+
+std::unique_ptr<mlir::Pass> createYosysOptimizer(
+    const std::string& yosysFilesPath, const std::string& abcPath, bool abcFast,
+    int unrollFactor, bool useSubmodules, Mode mode, bool printStats) {
+  return std::make_unique<YosysOptimizer>(yosysFilesPath, abcPath, abcFast,
+                                          unrollFactor, useSubmodules, mode,
+                                          printStats);
+}
+
+void registerYosysOptimizerPipeline(const std::string& yosysFilesPath,
+                                    const std::string& abcPath) {
+  PassPipelineRegistration<YosysOptimizerPipelineOptions>(
+      "yosys-optimizer", "The yosys optimizer pipeline.",
+      [yosysFilesPath, abcPath](OpPassManager& pm,
+                                const YosysOptimizerPipelineOptions& options) {
+        pm.addPass(createYosysOptimizer(
+            yosysFilesPath, abcPath, options.abcFast, options.unrollFactor,
+            options.useSubmodules, options.mode, options.printStats));
+        pm.addPass(mlir::createCSEPass());
+      });
+}
+
+}  // namespace heir
+}  // namespace mlir

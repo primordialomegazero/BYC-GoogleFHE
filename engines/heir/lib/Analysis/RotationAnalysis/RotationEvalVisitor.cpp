@@ -1,0 +1,128 @@
+#include "lib/Analysis/RotationAnalysis/RotationEvalVisitor.h"
+
+#include <cassert>
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "lib/Kernel/AbstractValue.h"
+#include "lib/Kernel/ArithmeticDag.h"
+#include "lib/Kernel/EvalVisitor.h"
+#include "lib/Utils/RotationUtils.h"
+#include "llvm/include/llvm/Support/ErrorHandling.h"  // from @llvm-project
+
+#define DEBUG_TYPE "rotation-analysis"
+
+namespace mlir {
+namespace heir {
+
+using kernel::ArithmeticDagNode;
+using kernel::DagType;
+using kernel::EvalResults;
+using kernel::LeftRotateBulkNode;
+using kernel::LeftRotateNode;
+using kernel::LiteralValue;
+using kernel::VariableNode;
+
+// This is a copy of EvalVisitor::operator() for LeftRotateNode, but recording
+// the materialized rotation amount and skipping the actual computation.
+EvalResults RotationEvalVisitor::operator()(
+    const LeftRotateNode<LiteralValue>& node) {
+  auto operand = this->process(node.operand)[0];
+  auto shape = operand.getShape();
+  assert(!shape.empty() && "rotate operand must be a tensor");
+  auto dim = shape.back();  // Use the slot dimension
+
+  auto evaluatedShift = this->process(node.shift)[0];
+  int amount = std::get<int>(evaluatedShift.get());
+
+  amount = normalizeRotation(amount, dim);
+  evaluatedShifts.insert(amount);
+
+  // We don't need to rotate the values for rotation analysis. We just return
+  // the operand as-is to keep the IR connected.
+  return {operand};
+}
+
+EvalResults RotationEvalVisitor::operator()(
+    const LeftRotateBulkNode<LiteralValue>& node) {
+  auto operand = this->process(node.operand)[0];
+  auto shape = operand.getShape();
+  assert(!shape.empty() && "rotate operand must be a tensor");
+  auto dim = shape.back();
+
+  for (const auto& shiftNode : node.shifts) {
+    auto evaluatedShift = this->process(shiftNode)[0];
+    int amount = std::get<int>(evaluatedShift.get());
+    amount = normalizeRotation(amount, dim);
+    evaluatedShifts.insert(amount);
+  }
+
+  // We don't need to rotate the values for rotation analysis. We just return
+  // the operand as-is to keep the IR connected.
+  return {operand};
+}
+
+EvalResults RotationEvalVisitor::operator()(
+    const kernel::InsertNode<LiteralValue>& node) {
+  this->process(node.scalar);
+  auto dest = this->process(node.dest);
+  this->process(node.index);
+  return dest;
+}
+
+EvalResults RotationEvalVisitor::operator()(
+    const VariableNode<LiteralValue>& node) {
+  if (node.value.has_value()) {
+    return {node.value.value()};
+  }
+
+  // If the variable is not set, then it came from an SSA value that was not
+  // directly part of the defined kernel. We populate the variable with a
+  // zero-valued tensor because the actual values don't matter, just the
+  // rotation indices.
+  DagType dagType = node.type;
+  return std::visit(
+      [&](auto&& arg) -> EvalResults {
+        using T = std::decay_t<decltype(arg)>;
+        if constexpr (std::is_same_v<T, kernel::IntegerType>) {
+          return {LiteralValue(0)};
+        } else if constexpr (std::is_same_v<T, kernel::FloatType>) {
+          return {LiteralValue(0)};
+        } else if constexpr (std::is_same_v<T, kernel::IndexType>) {
+          return {LiteralValue(0)};
+        } else if constexpr (std::is_same_v<T, kernel::IntTensorType>) {
+          auto shape = arg.shape;
+          assert(!shape.empty() && "expected nonempty shape");
+          if (shape.size() == 1) {
+            return {LiteralValue(std::vector<int>(shape[0], 0))};
+          }
+          return {LiteralValue(std::vector<std::vector<int>>(
+              shape[0], std::vector<int>(shape[1], 0)))};
+        } else if constexpr (std::is_same_v<T, kernel::FloatTensorType>) {
+          auto shape = arg.shape;
+          assert(!shape.empty() && "expected nonempty shape");
+          if (shape.size() == 1) {
+            return {LiteralValue(std::vector<int>(shape[0], 0))};
+          }
+          return {LiteralValue(std::vector<std::vector<int>>(
+              shape[0], std::vector<int>(shape[1], 0)))};
+        }
+        llvm_unreachable("Unknown DagType variant");
+      },
+      dagType.type_variant);
+}
+
+std::set<int> evalRotations(
+    const std::shared_ptr<ArithmeticDagNode<LiteralValue>>& dag) {
+  RotationEvalVisitor visitor;
+  auto evalResults = visitor.process(dag);
+  return std::move(visitor.getEvaluatedShifts());
+}
+
+}  // namespace heir
+}  // namespace mlir

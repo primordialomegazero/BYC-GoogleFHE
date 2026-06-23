@@ -1,0 +1,236 @@
+#include "lib/Analysis/NoiseAnalysis/BFV/NoiseByBoundCoeffModel.h"
+
+#include <cmath>
+#include <numeric>
+
+#include "lib/Analysis/NoiseAnalysis/Noise.h"
+#include "llvm/include/llvm/Support/ErrorHandling.h"  // from @llvm-project
+
+namespace mlir {
+namespace heir {
+namespace bfv {
+
+using LocalParamType = NoiseByBoundCoeffModel::LocalParamType;
+using SchemParamType = NoiseByBoundCoeffModel::SchemeParamType;
+using StateType = NoiseByBoundCoeffModel::StateType;
+
+// the formulae below are mainly taken from KPZ21
+// "Revisiting Homomorphic Encryption Schemes for Finite Fields"
+// https://ia.cr/2021/204
+
+double NoiseByBoundCoeffModel::toLogBound(const LocalParamType& param,
+                                          const StateType& noise) const {
+  // Also noise.getValue is log2||e||
+  return noise.getValue();
+}
+
+double NoiseByBoundCoeffModel::toLogBudget(const LocalParamType& param,
+                                           const StateType& noise) const {
+  return toLogTotal(param) - toLogBound(param, noise);
+}
+
+double NoiseByBoundCoeffModel::toLogTotal(const LocalParamType& param) const {
+  double total = 0;
+  auto logqi = param.getSchemeParam()->getLogqi();
+  for (auto i = 0; i <= param.getSchemeParam()->getLevel(); ++i) {
+    total += logqi[i];
+  }
+  double logT = log2(param.getSchemeParam()->getPlaintextModulus());
+  return total - logT - 1.0;
+}
+
+double NoiseByBoundCoeffModel::getExpansionFactor(
+    const LocalParamType& param) const {
+  auto n = param.getSchemeParam()->getRingDim();
+  switch (variant) {
+    case NoiseModelVariant::WORST_CASE:
+      // worst-case
+      // well known from DPSZ12
+      return n;
+    case NoiseModelVariant::AVERAGE_CASE:
+      // average-case
+      // experimental result
+      // cite HPS19 and KPZ21
+      // this applies for e * s, e * e
+      return 2.0 * sqrt(n);
+    default:
+      llvm_unreachable("Unknown noise model variant");
+      return 0.0;
+  }
+}
+
+double NoiseByBoundCoeffModel::getExpansionFactorForModulusSwitching(
+    const LocalParamType& param) const {
+  auto n = param.getSchemeParam()->getRingDim();
+  switch (variant) {
+    case NoiseModelVariant::WORST_CASE:
+      // well known from DPSZ12
+      return n;
+    case NoiseModelVariant::AVERAGE_CASE:
+      // experimental result
+      // See https://github.com/openfheorg/openfhe-development/pull/1007
+      // this applies for tau * s, tau * tau, s * s
+      // where tau is the rounding error during modulus switching
+      return 4.0 * sqrt(n);
+    default:
+      llvm_unreachable("Unknown noise model variant");
+      return 0.0;
+  }
+}
+
+double NoiseByBoundCoeffModel::getBoundErr(const LocalParamType& param) const {
+  auto std0 = param.getSchemeParam()->getStd0();
+  // probability of larger than 6 * std0 is less than 2^{-30}
+  auto assurance = 6;
+  auto boundErr = std0 * assurance;
+  return boundErr;
+}
+
+double NoiseByBoundCoeffModel::getBoundKey(const LocalParamType& param) const {
+  // assume UNIFORM_TERNARY
+  auto boundKey = 1.0;
+  return boundKey;
+}
+
+typename NoiseByBoundCoeffModel::StateType
+NoiseByBoundCoeffModel::evalEncryptPk(const LocalParamType& param) const {
+  auto boundErr = getBoundErr(param);
+  auto boundKey = getBoundKey(param);
+  auto expansionFactor = getExpansionFactor(param);
+
+  // public key (-as + e, a)
+  // public key encryption (-aus + u * e + e_0 + (Q/t)m, au + e_1)
+  // (Q/t)m + u * e + e_1 * s + e_0
+  // v_fresh = u * e + e_1 * s + e_0
+  double fresh = boundErr * (1. + 2. * expansionFactor * boundKey);
+  return StateType::of(fresh);
+}
+
+typename NoiseByBoundCoeffModel::StateType
+NoiseByBoundCoeffModel::evalEncryptSk(const LocalParamType& param) const {
+  auto boundErr = getBoundErr(param);
+
+  // secret key s
+  // secret key encryption (-as + (Q/t)m + e, a)
+  // v_fresh = e
+  double fresh = boundErr;
+  return StateType::of(fresh);
+}
+
+typename NoiseByBoundCoeffModel::StateType NoiseByBoundCoeffModel::evalEncrypt(
+    const LocalParamType& param) const {
+  auto usePublicKey = param.getSchemeParam()->getUsePublicKey();
+  auto isEncryptionTechniqueExtended =
+      param.getSchemeParam()->isEncryptionTechniqueExtended();
+  if (isEncryptionTechniqueExtended) {
+    // for extended encryption technique, namely encrypt at Qp then mod reduce
+    // back to Q, the noise is modreduce(encrypt)
+    auto expansionFactorMS = getExpansionFactorForModulusSwitching(param);
+    auto boundKey = getBoundKey(param);
+
+    auto added = (1.0 + expansionFactorMS * boundKey) / 2;
+    return StateType::of(added);
+  }
+  if (usePublicKey) {
+    return evalEncryptPk(param);
+  }
+  return evalEncryptSk(param);
+}
+
+typename NoiseByBoundCoeffModel::StateType NoiseByBoundCoeffModel::evalConstant(
+    const LocalParamType& param) const {
+  // constant is (Q/t)m + 0
+  // v_constant = 0
+  return StateType::of(0);
+}
+
+typename NoiseByBoundCoeffModel::StateType NoiseByBoundCoeffModel::evalAdd(
+    const StateType& lhs, const StateType& rhs) const {
+  // (Q/t)m_0 + v_0 + (Q/t)m_1 + v_1 <= (Q/t)[m_0 + m_1]_t + (v_0 + v_1 + r(Q)u)
+  // mod Q v_add = v_0 + v_1 + r(Q)u
+  // where ||u|| <= 1
+  return lhs + rhs + 1;
+}
+
+typename NoiseByBoundCoeffModel::StateType NoiseByBoundCoeffModel::evalMul(
+    const LocalParamType& resultParam, const StateType& lhs,
+    const StateType& rhs) const {
+  auto expansionFactor = getExpansionFactor(resultParam);
+  auto expansionFactorMS = getExpansionFactorForModulusSwitching(resultParam);
+  auto t = resultParam.getSchemeParam()->getPlaintextModulus();
+  auto v0 = lhs;
+  auto v1 = rhs;
+  auto boundKey = getBoundKey(resultParam);
+
+  auto logqiVec = resultParam.getSchemeParam()->getLogqi();
+  auto Qinv = StateType::of(1);
+  for (auto logqi : logqiVec) {
+    Qinv = Qinv * std::exp2(-logqi);
+  }
+
+  // See KPZ21
+  auto term1 = v0 * v1 * expansionFactor * t * Qinv;
+  auto term2 = (v0 + v1) * (expansionFactor * t / 2.0) *
+               (4.0 + expansionFactorMS * boundKey);
+  auto term3 = StateType::of(
+      (1.0 + expansionFactorMS * boundKey +
+       expansionFactor * expansionFactorMS * boundKey * boundKey) /
+      2.0);
+  return term1 + term2 + term3;
+}
+
+typename NoiseByBoundCoeffModel::StateType
+NoiseByBoundCoeffModel::evalRelinearizeHYBRID(const LocalParamType& inputParam,
+                                              const StateType& input) const {
+  // for v_input, after modup and moddown, it remains the same (with rounding).
+  // We only need to consider the error from key switching key
+  // and rounding error during moddown.
+  // Check the B.1.3 section of KPZ21 for more details.
+
+  // also note that for cv > 3 (e.g. multiplication), we need to relinearize
+  // more terms like ct_3 and ct_4.
+  // this is a common path for mult relinearize and rotation relinearize
+  // so no assertion here for now.
+
+  auto dnum = inputParam.getSchemeParam()->getDnum();
+  auto expansionFactor = getExpansionFactor(inputParam);
+  auto expansionFactorMS = getExpansionFactorForModulusSwitching(inputParam);
+  auto boundErr = getBoundErr(inputParam);
+  auto boundKey = getBoundKey(inputParam);
+
+  auto level = inputParam.getSchemeParam()->getLevel();
+  // modup from Q to QP, so one more digit
+  auto numDigit = ceil(static_cast<double>(level + 1) / dnum) + 1;
+
+  // log(qiq_{i+1}...), the digit size for a certain digit
+  // we use log(pip_{i+1}...) as an approximation,
+  // as we often choose P > each digit
+
+  // the HYBRID key switching error is
+  // sum over all digit (ct_2 * e_ksk)
+  // there are "currentNumDigit" digits
+  // and ||c_2|| <= digitSize / 2
+  // ||c_2 * e_ksk|| <= delta * digitSize * Berr / 2
+  // moddown by P, as digitSize / P < 1
+  auto scaled = StateType::of(numDigit * expansionFactor * boundErr / 2.0);
+
+  // moddown added noise, similar to modreduce above.
+  auto added = StateType::of((1.0 + expansionFactorMS * boundKey) / 2);
+
+  // for relinearization after multiplication, often scaled + added is far less
+  // than input.
+  return input + scaled + added;
+}
+
+typename NoiseByBoundCoeffModel::StateType
+NoiseByBoundCoeffModel::evalRelinearize(const LocalParamType& inputParam,
+                                        const StateType& input) const {
+  // assume HYBRID
+  // if we further introduce BV to SchemeParam we can have alternative
+  // implementation.
+  return evalRelinearizeHYBRID(inputParam, input);
+}
+
+}  // namespace bfv
+}  // namespace heir
+}  // namespace mlir

@@ -1,0 +1,234 @@
+#ifndef LIB_TARGET_OPENFHEPKE_OPENFHEPKEEMITTER_H_
+#define LIB_TARGET_OPENFHEPKE_OPENFHEPKEEMITTER_H_
+
+#include <cstdint>
+#include <map>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// IWYU pragma: begin_keep
+#include "include/cereal/cereal.hpp"        // from @cereal
+#include "include/cereal/types/map.hpp"     // from @cereal
+#include "include/cereal/types/string.hpp"  // from @cereal
+#include "include/cereal/types/vector.hpp"  // from @cereal
+// IWYU pragma: end_keep
+
+#include "lib/Analysis/Cpp/ConstQualifierAnalysis.h"
+#include "lib/Analysis/SelectVariableNames/SelectVariableNames.h"
+#include "lib/Dialect/Openfhe/IR/OpenfheOps.h"
+#include "lib/Target/OpenFhePke/OpenFheUtils.h"
+#include "llvm/include/llvm/Support/raw_ostream.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Affine/IR/AffineOps.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
+#include "mlir/include/mlir/Dialect/MemRef/IR/MemRef.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
+#include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinOps.h"             // from @llvm-project
+#include "mlir/include/mlir/IR/Location.h"               // from @llvm-project
+#include "mlir/include/mlir/IR/Operation.h"              // from @llvm-project
+#include "mlir/include/mlir/IR/Types.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/Value.h"                  // from @llvm-project
+#include "mlir/include/mlir/IR/ValueRange.h"             // from @llvm-project
+#include "mlir/include/mlir/Support/IndentedOstream.h"   // from @llvm-project
+#include "mlir/include/mlir/Support/LLVM.h"              // from @llvm-project
+#include "mlir/include/mlir/Support/LogicalResult.h"     // from @llvm-project
+
+namespace mlir {
+namespace heir {
+namespace openfhe {
+
+/// Translates the given operation to OpenFhePke.
+::mlir::LogicalResult translateToOpenFhePke(::mlir::Operation* op,
+                                            llvm::raw_ostream& os,
+                                            const OpenfheImportType& importType,
+                                            const std::string& weightsFile,
+                                            bool skipVectorResizing);
+
+// A map from the SSA value name of a 1-D dense element constants to its value.
+// Note that multidimensional shapes are handled as flattened 1-D vectors.
+struct Weights {
+  std::map<std::string, std::vector<float>> floats;
+  std::map<std::string, std::vector<double>> doubles;
+  std::map<std::string, std::vector<int64_t>> int64_ts;
+  std::map<std::string, std::vector<int32_t>> int32_ts;
+  std::map<std::string, std::vector<int16_t>> int16_ts;
+  std::map<std::string, std::vector<int8_t>> int8_ts;
+
+  template <class Archive>
+  void serialize(Archive& archive) {
+    archive(CEREAL_NVP(floats), CEREAL_NVP(doubles), CEREAL_NVP(int64_ts),
+            CEREAL_NVP(int32_ts), CEREAL_NVP(int16_ts), CEREAL_NVP(int8_ts));
+  }
+};
+
+class OpenFhePkeEmitter {
+ public:
+  OpenFhePkeEmitter(raw_ostream& os, SelectVariableNames* variableNames,
+                    ConstQualifierAnalysis* constQualifierAnalysis,
+                    const OpenfheImportType& importType,
+                    const std::string& weightsFile, bool skipVectorResizing);
+
+  LogicalResult translate(::mlir::Operation& operation);
+
+ private:
+  OpenfheImportType importType_;
+
+  /// Output stream to emit to.
+  raw_indented_ostream os;
+
+  /// Pre-populated analysis selecting unique variable names for all the SSA
+  /// values.
+  SelectVariableNames* variableNames;
+
+  /// Pre-populated analysis describing which variables can be emitted
+  /// as const or const auto&
+  ConstQualifierAnalysis* constQualifierAnalysis;
+
+  /// Set of values that are mutable and don't need assign prefixes.
+  llvm::DenseSet<::mlir::Value> mutableValues;
+
+  // Module containing global weights
+  Weights weightsMap_;
+
+  const std::string& weightsFile_;
+
+  // Whether to skip resizing vectors to ring dimension / 2
+  bool skipVectorResizing_;
+
+  // Functions for printing individual ops
+  LogicalResult printOperation(::mlir::ModuleOp op);
+  LogicalResult printOperation(::mlir::affine::AffineForOp op);
+  LogicalResult printOperation(::mlir::affine::AffineYieldOp op);
+  LogicalResult printOperation(::mlir::arith::AddIOp op);
+  LogicalResult printOperation(::mlir::arith::AddFOp op);
+  LogicalResult printOperation(::mlir::arith::AndIOp op);
+  LogicalResult printOperation(::mlir::arith::OrIOp op);
+  LogicalResult printOperation(::mlir::arith::XOrIOp op);
+  LogicalResult printOperation(::mlir::arith::CmpIOp op);
+  LogicalResult printOperation(::mlir::arith::CmpFOp op);
+  LogicalResult printOperation(::mlir::arith::ConstantOp op);
+  LogicalResult printOperation(::mlir::arith::DivSIOp op);
+  LogicalResult printOperation(::mlir::arith::ExtFOp op);
+  LogicalResult printOperation(::mlir::arith::ExtSIOp op);
+  LogicalResult printOperation(::mlir::arith::ExtUIOp op);
+  LogicalResult printOperation(::mlir::arith::FloorDivSIOp op);
+  LogicalResult printOperation(::mlir::arith::IndexCastOp op);
+  LogicalResult printOperation(::mlir::arith::MaxSIOp op);
+  LogicalResult printOperation(::mlir::arith::MinSIOp op);
+  LogicalResult printOperation(::mlir::arith::MulIOp op);
+  LogicalResult printOperation(::mlir::arith::MulFOp op);
+  LogicalResult printOperation(::mlir::arith::RemSIOp op);
+  LogicalResult printOperation(::mlir::arith::SelectOp op);
+  LogicalResult printOperation(::mlir::arith::SubIOp op);
+  LogicalResult printOperation(::mlir::arith::SubFOp op);
+  LogicalResult printOperation(::mlir::arith::DivFOp op);
+  LogicalResult printOperation(::mlir::scf::IfOp op);
+  LogicalResult printOperation(::mlir::scf::ForOp op);
+  LogicalResult printOperation(::mlir::scf::ForallOp op);
+  LogicalResult printOperation(::mlir::scf::InParallelOp op);
+  LogicalResult printOperation(::mlir::scf::YieldOp op);
+  LogicalResult printOperation(::mlir::tensor::ConcatOp op);
+  LogicalResult printOperation(::mlir::tensor::EmptyOp op);
+  LogicalResult printOperation(::mlir::tensor::ExtractOp op);
+  LogicalResult printOperation(::mlir::tensor::ExtractSliceOp op);
+  LogicalResult printOperation(::mlir::tensor::CollapseShapeOp op);
+  LogicalResult printOperation(::mlir::tensor::ExpandShapeOp op);
+  LogicalResult printOperation(::mlir::tensor::InsertOp op);
+  LogicalResult printOperation(::mlir::tensor::InsertSliceOp op);
+  LogicalResult printOperation(::mlir::tensor::ParallelInsertSliceOp op);
+  LogicalResult printOperation(::mlir::tensor::SplatOp op);
+  LogicalResult printOperation(::mlir::tensor::FromElementsOp op);
+  LogicalResult printOperation(::mlir::cf::AssertOp op);
+  LogicalResult printOperation(::mlir::memref::AllocOp op);
+  LogicalResult printOperation(::mlir::memref::LoadOp op);
+  LogicalResult printOperation(::mlir::memref::StoreOp op);
+  LogicalResult printOperation(::mlir::func::FuncOp op);
+  LogicalResult printOperation(::mlir::func::CallOp op);
+  LogicalResult printOperation(::mlir::func::ReturnOp op);
+  LogicalResult printOperation(AddInPlaceOp op);
+  LogicalResult printOperation(AddOp op);
+  LogicalResult printOperation(AddPlainInPlaceOp op);
+  LogicalResult printOperation(AddPlainOp op);
+  LogicalResult printOperation(AutomorphOp op);
+  LogicalResult printOperation(BootstrapOp op);
+  LogicalResult printOperation(DecodeCKKSOp op);
+  LogicalResult printOperation(DecodeOp op);
+  LogicalResult printOperation(DecryptOp op);
+  LogicalResult printOperation(EncryptOp op);
+  LogicalResult printOperation(FastRotationOp op);
+  LogicalResult printOperation(FastRotationExtOp op);
+  LogicalResult printOperation(FastRotationPrecomputeOp op);
+  LogicalResult printOperation(GenBootstrapKeyOp op);
+  LogicalResult printOperation(GenContextOp op);
+  LogicalResult printOperation(GenMulKeyOp op);
+  LogicalResult printOperation(GenParamsOp op);
+  LogicalResult printOperation(GenRotKeyOp op);
+  LogicalResult printOperation(KeySwitchInPlaceOp op);
+  LogicalResult printOperation(KeySwitchOp op);
+  LogicalResult printOperation(KeySwitchDownOp op);
+  LogicalResult printOperation(LevelReduceInPlaceOp op);
+  LogicalResult printOperation(LevelReduceOp op);
+  LogicalResult printOperation(MakeCKKSPackedPlaintextOp op);
+  LogicalResult printOperation(MakePackedPlaintextOp op);
+  LogicalResult printOperation(ModReduceInPlaceOp op);
+  LogicalResult printOperation(ModReduceOp op);
+  LogicalResult printOperation(MulConstInPlaceOp op);
+  LogicalResult printOperation(MulConstOp op);
+  LogicalResult printOperation(MulNoRelinOp op);
+  LogicalResult printOperation(MulOp op);
+  LogicalResult printOperation(MulPlainOp op);
+  LogicalResult printOperation(NegateInPlaceOp op);
+  LogicalResult printOperation(NegateOp op);
+  LogicalResult printOperation(RelinInPlaceOp op);
+  LogicalResult printOperation(RelinOp op);
+  LogicalResult printOperation(RotOp op);
+  LogicalResult printOperation(SetupBootstrapOp op);
+  LogicalResult printOperation(SquareInPlaceOp op);
+  LogicalResult printOperation(SquareOp op);
+  LogicalResult printOperation(SubInPlaceOp op);
+  LogicalResult printOperation(SubOp op);
+  LogicalResult printOperation(SubPlainInPlaceOp op);
+  LogicalResult printOperation(SubPlainOp op);
+
+  // Helpers for above
+  LogicalResult printEvalMethod(::mlir::Value result,
+                                ::mlir::Value cryptoContext,
+                                ::mlir::ValueRange nonEvalOperands,
+                                std::string_view op);
+  LogicalResult printEvalInPlaceMethod(::mlir::Value result,
+                                       ::mlir::Value cryptoContext,
+                                       ::mlir::ValueRange nonEvalOperands,
+                                       std::string_view op);
+  LogicalResult printBinaryOp(Operation* op, ::mlir::Value lhs,
+                              ::mlir::Value rhs, std::string_view opName);
+  LogicalResult decodeCore(::mlir::Location loc, ::mlir::Value input,
+                           ::mlir::Value result, bool isCKKS);
+
+  // A helper for a special case of ExtractSliceOp
+  LogicalResult extractRowFromMatrix(tensor::ExtractSliceOp op);
+
+  // Emit an OpenFHE type, using a const specifier if constant is true
+  LogicalResult emitType(::mlir::Type type, ::mlir::Location loc,
+                         bool constant = false);
+
+  std::string getDebugAttrMapName() {
+    static int debugAttrMapCount = 0;
+    return "debugAttrMap" + std::to_string(debugAttrMapCount++);
+  }
+
+  void emitAutoAssignPrefix(::mlir::Value result);
+  LogicalResult emitTypedAssignPrefix(::mlir::Value result,
+                                      ::mlir::Location loc,
+                                      bool constant = false);
+
+  std::string getConstantOrValue(Value value);
+};
+
+}  // namespace openfhe
+}  // namespace heir
+}  // namespace mlir
+
+#endif  // LIB_TARGET_OPENFHEPKE_OPENFHEPKEEMITTER_H_

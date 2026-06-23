@@ -1,0 +1,84 @@
+#ifndef LIB_DIALECT_LWE_TRANSFORMS_PASSES_TD_
+#define LIB_DIALECT_LWE_TRANSFORMS_PASSES_TD_
+
+include "mlir/Pass/PassBase.td"
+
+
+def AddDebugPort : Pass<"lwe-add-debug-port"> {
+  let summary = "Add debug port to (R)LWE encrypted functions";
+  let description = [{
+  This pass adds debug ports to the specified function in the IR. The debug ports
+  are prefixed with "__heir_debug" and are invoked after each homomorphic operation in the
+  function. The debug ports are declarations and user should provide functions with
+  the same name in their code.
+
+  If the option `insert-debug-after-every-op` is set to true, it will insert a `debug.validate`
+  op after every homomorphic operation.
+
+  Regardless of the `insert-debug-after-every-op` option, this pass will lower all
+  `debug.validate` ops it encounters to function calls.
+
+  For example, if the function is called "foo", the secret key is added to its
+  arguments, and the debug port is called after each homomorphic operation:
+  ```mlir
+  // declaration of external debug function
+  func.func private @__heir_debug(%sk : !sk, %ct : !ct)
+
+  // secret key added as function arg
+  func.func @foo(%sk : !sk, ...) {
+    %ct = lwe.radd ...
+    // invoke external debug function
+    __heir_debug(%sk, %ct)
+    %ct1 = lwe.rmul ...
+    __heir_debug(%sk, %ct1)
+    ...
+  }
+  ```
+  }];
+  let dependentDialects = [
+    "mlir::heir::lwe::LWEDialect",
+    "mlir::heir::debug::DebugDialect"
+  ];
+  let options = [
+    Option<"entryFunction", "entry-function", "std::string",
+           /*default=*/"", "Default entry function "
+           "name of entry function.">,
+    Option<"messageSize", "message-size", "int",
+           /*default=*/"1", "The size of the message in the ciphertext.">,
+    Option<"insertDebugAfterEveryOp", "insert-debug-after-every-op", "bool",
+           /*default=*/"false", "Whether to add debug ports after every op">
+  ];
+}
+
+def ImplementTrivialEncryptionAsAddition : Pass<"implement-trivial-encryption-as-addition"> {
+  let summary = "Implement `lwe.trivial_encrypt` as ciphertext-plaintext addition";
+  let description = [{
+    This pass implements trivial encryption as a plaintext-ciphertext addition
+    using an extra user input corresponding to an encryption of zero. This pass
+    adds an additional function argument for the encryption of zero, and an
+    additional client helper function to create it; this extra value must be
+    additionally plumbed from the client to the compiled function.
+
+    (* example filepath=tests/Dialect/LWE/Transforms/implement_trivial_encryption_as_addition.mlir *)
+  }];
+  let dependentDialects = [
+    "mlir::heir::lwe::LWEDialect",
+    "mlir::func::FuncDialect",
+  ];
+
+  let options = [];
+}
+
+def DecomposeKeySwitch : Pass<"lwe-decompose-keyswitch"> {
+  let summary = "Decomposes lwe.key_switch_inner into primitive LWE ops";
+  let description = [{
+  (* example filepath=tests/Dialect/LWE/Transforms/decompose_keyswitch.mlir *)
+  }];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::heir::lwe::LWEDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
+#endif  // LIB_DIALECT_LWE_TRANSFORMS_PASSES_TD_

@@ -1,0 +1,271 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(
+    default_applicable_licenses = ["@heir//:license"],
+    default_visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "Utils",
+    srcs = ["Utils.cpp"],
+    hdrs = ["Utils.h"],
+    deps = [
+        ":MathUtils",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "AffineMapUtils",
+    srcs = ["AffineMapUtils.cpp"],
+    hdrs = ["AffineMapUtils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "TensorUtils",
+    srcs = ["TensorUtils.cpp"],
+    hdrs = ["TensorUtils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:DialectUtils",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "APIntUtils",
+    srcs = ["APIntUtils.cpp"],
+    hdrs = ["APIntUtils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "AttributeUtils",
+    srcs = ["AttributeUtils.cpp"],
+    hdrs = ["AttributeUtils.h"],
+    deps = [
+        "@heir//lib/Dialect:HEIRInterfaces",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AffineDialect",
+        "@llvm-project//mlir:ControlFlowInterfaces",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:FunctionInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "ConversionUtils",
+    srcs = ["ConversionUtils.cpp"],
+    hdrs = ["ConversionUtils.h"],
+    deps = [
+        "@heir//lib/Dialect/LWE/IR:Dialect",
+        "@heir//lib/Dialect/TfheRust/IR:Dialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AffineDialect",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:FuncTransforms",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LinalgDialect",
+        "@llvm-project//mlir:MemRefDialect",
+        "@llvm-project//mlir:SCFTransforms",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:TransformUtils",
+    ],
+)
+
+cc_library(
+    name = "ContextAwareConversionUtils",
+    srcs = ["ContextAwareConversionUtils.cpp"],
+    hdrs = ["ContextAwareConversionUtils.h"],
+    deps = [
+        ":AttributeUtils",
+        ":ContextAwareDialectConversion",
+        ":ContextAwareTypeConversion",
+        ":Utils",
+        "@heir//lib/Dialect/LWE/IR:Dialect",
+        "@heir//lib/Dialect/Mgmt/IR:Dialect",
+        "@heir//lib/Dialect/Secret/IR:Dialect",
+        "@heir//lib/Dialect/TensorExt/IR:Dialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:FunctionInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:TransformUtils",
+    ],
+)
+
+cc_library(
+    name = "ContextAwareTypeConversion",
+    srcs = ["ContextAwareTypeConversion.cpp"],
+    hdrs = ["ContextAwareTypeConversion.h"],
+    deps = [
+        ":AttributeUtils",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FunctionInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TransformUtils",
+    ],
+)
+
+cc_library(
+    name = "ContextAwareDialectConversion",
+    srcs = ["ContextAwareDialectConversion.cpp"],
+    hdrs = ["ContextAwareDialectConversion.h"],
+    deps = [
+        ":ContextAwareTypeConversion",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Rewrite",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TransformUtils",
+        "@llvm-project//mlir:config",
+    ],
+)
+
+cc_library(
+    name = "MathUtils",
+    srcs = ["MathUtils.cpp"],
+    hdrs = ["MathUtils.h"],
+    deps = [
+        ":APIntUtils",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "RotationUtils",
+    hdrs = ["RotationUtils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+cc_library(
+    name = "LogArithmetic",
+    srcs = ["LogArithmetic.cpp"],
+    hdrs = ["LogArithmetic.h"],
+)
+
+cc_test(
+    name = "LogArithmeticTest",
+    srcs = ["LogArithmeticTest.cpp"],
+    deps = [
+        ":LogArithmetic",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "APIntUtilsTest",
+    srcs = ["APIntUtilsTest.cpp"],
+    deps = [
+        ":APIntUtils",
+        "@googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_test(
+    name = "APIntUtilsBenchmark",
+    srcs = ["APIntUtilsBenchmark.cpp"],
+    deps = [
+        ":APIntUtils",
+        "@google_benchmark//:benchmark_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_test(
+    name = "MathUtilsTest",
+    srcs = ["MathUtilsTest.cpp"],
+    deps = [
+        ":APIntUtils",
+        ":MathUtils",
+        "@fuzztest//fuzztest",
+        "@googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "TargetUtils",
+    srcs = ["TargetUtils.cpp"],
+    hdrs = ["TargetUtils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "TransformUtils",
+    srcs = ["TransformUtils.cpp"],
+    hdrs = ["TransformUtils.h"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+    ],
+)
+
+cc_library(
+    name = "AllocToInPlaceUtils",
+    # avoid http://go/cpp-features#layering_check with an empty cpp file
+    srcs = ["AllocToInPlaceUtils.cpp"],
+    hdrs = ["AllocToInPlaceUtils.h"],
+    deps = [
+        "@heir//lib/Analysis/LevelAnalysis",
+        "@heir//lib/Utils/Tablegen:InPlaceOpInterface",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Analysis",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:MemRefDialect",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+    ],
+)
+
+cc_test(
+    name = "UtilsTest",
+    srcs = ["UtilsTest.cpp"],
+    deps = [
+        ":Utils",
+        "@googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)

@@ -1,0 +1,36 @@
+#ifndef LIB_DIALECT_SECRET_IR_SECRETTYPES_TD_
+#define LIB_DIALECT_SECRET_IR_SECRETTYPES_TD_
+
+include "SecretDialect.td"
+
+include "lib/Dialect/HEIRInterfaces.td"
+include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/DialectBase.td"
+
+// A base class for all types in this dialect
+class Secret_Type<string name, string typeMnemonic, list<Trait> traits = []>
+    : TypeDef<Secret_Dialect, name, traits> {
+  let mnemonic = typeMnemonic;
+}
+
+def Secret : Secret_Type<"Secret", "secret", [SecretTypeInterface]> {
+  let summary = "A secret value";
+
+  let description = [{
+    A generic wrapper around another MLIR type, representing an encrypted value
+    but not specifying the manner of encryption. This is useful in HEIR because
+    the compiler may choose various details of the FHE scheme based on the
+    properties of the input program, the backend target hardware, and cost
+    models of the various passes.
+  }];
+
+  let parameters = (ins "Type":$valueType);
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "Type":$valueType), [{
+      return $_get(valueType.getContext(), valueType);
+    }]>
+  ];
+  let assemblyFormat = "`<` $valueType `>`";
+}
+
+#endif  // LIB_DIALECT_SECRET_IR_SECRETTYPES_TD_
